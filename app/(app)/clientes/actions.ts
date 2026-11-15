@@ -3,9 +3,9 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
+import { Prisma } from "@/lib/generated/prisma/client";
 import { TipoCliente, TipoEquipo } from "@/lib/generated/prisma/enums";
-import { nuevoCliente, nuevoEquipo } from "@/lib/mock/fabricas";
-import { storeParaAcciones } from "@/lib/mock/store";
+import { db } from "@/lib/db";
 import { sumarMeses } from "@/lib/fechas";
 import {
   datosDe,
@@ -16,6 +16,20 @@ import {
   zTextoOpcional,
   type EstadoForm,
 } from "@/lib/forms";
+
+const CLIENTE_NO_ENCONTRADO = "No encontramos este cliente. Puede que se haya borrado.";
+
+/**
+ * Errores de Prisma que puede provocar el usuario (registro borrado mientras
+ * editaba, referencia que ya no existe). Devuelve el mensaje o null si es otro error.
+ */
+function mensajeDeError(e: unknown, noEncontrado: string): string | null {
+  if (!(e instanceof Prisma.PrismaClientKnownRequestError)) return null;
+  // P2025: registro no encontrado. P2003: la referencia (cliente) ya no existe.
+  if (e.code === "P2025" || e.code === "P2003") return noEncontrado;
+  if (e.code === "P2002") return "Ya hay un registro con esos datos.";
+  return null;
+}
 
 // ───────── Clientes ─────────
 
@@ -40,23 +54,31 @@ export async function crearCliente(_prev: EstadoForm, formData: FormData): Promi
   const r = esquemaCliente.safeParse(datosDe(formData));
   if (!r.success) return erroresDeZod(r.error);
 
-  const s = storeParaAcciones();
-  const cliente = nuevoCliente(r.data);
-  s.clientes.push(cliente);
+  let id: string;
+  try {
+    ({ id } = await db().cliente.create({ data: r.data, select: { id: true } }));
+  } catch (e) {
+    const mensaje = mensajeDeError(e, CLIENTE_NO_ENCONTRADO);
+    if (mensaje) return { error: mensaje };
+    throw e;
+  }
 
   revalidatePath("/clientes");
-  redirect(`/clientes/${cliente.id}`);
+  redirect(`/clientes/${id}`);
 }
 
 export async function editarCliente(id: string, _prev: EstadoForm, formData: FormData): Promise<EstadoForm> {
   const r = esquemaCliente.safeParse(datosDe(formData));
   if (!r.success) return erroresDeZod(r.error);
 
-  const s = storeParaAcciones();
-  const cliente = s.clientes.find((c) => c.id === id);
-  if (!cliente) return { error: "No encontramos este cliente. Puede que se haya borrado." };
-
-  Object.assign(cliente, r.data, { updatedAt: new Date() });
+  try {
+    // updatedAt lo pone Prisma (@updatedAt). Si el cliente no existe: P2025.
+    await db().cliente.update({ where: { id }, data: r.data, select: { id: true } });
+  } catch (e) {
+    const mensaje = mensajeDeError(e, CLIENTE_NO_ENCONTRADO);
+    if (mensaje) return { error: mensaje };
+    throw e;
+  }
 
   revalidatePath("/clientes");
   revalidatePath(`/clientes/${id}`);
@@ -89,20 +111,26 @@ export async function crearEquipo(clienteId: string, _prev: EstadoForm, formData
   const r = esquemaEquipo.safeParse(datosDe(formData));
   if (!r.success) return erroresDeZod(r.error);
 
-  const s = storeParaAcciones();
-  if (!s.clientes.some((c) => c.id === clienteId)) {
-    return { error: "No encontramos este cliente. Puede que se haya borrado." };
-  }
+  const cliente = await db().cliente.findUnique({ where: { id: clienteId }, select: { id: true } });
+  if (!cliente) return { error: CLIENTE_NO_ENCONTRADO };
 
   const d = r.data;
-  s.equipos.push(
-    nuevoEquipo({
-      clienteId,
-      ...d,
-      // Sin fecha de mantenimiento: a un año de la instalación.
-      proximoMantenimiento: d.proximoMantenimiento ?? (d.fechaInstalacion ? sumarMeses(d.fechaInstalacion, 12) : null),
-    }),
-  );
+  try {
+    await db().equipo.create({
+      data: {
+        clienteId,
+        ...d,
+        // Sin fecha de mantenimiento: a un año de la instalación.
+        proximoMantenimiento: d.proximoMantenimiento ?? (d.fechaInstalacion ? sumarMeses(d.fechaInstalacion, 12) : null),
+      },
+      select: { id: true },
+    });
+  } catch (e) {
+    // Por si el cliente se borró entre la verificación y el alta (P2003).
+    const mensaje = mensajeDeError(e, CLIENTE_NO_ENCONTRADO);
+    if (mensaje) return { error: mensaje };
+    throw e;
+  }
 
   revalidatePath(`/clientes/${clienteId}`);
   redirect(`/clientes/${clienteId}`);

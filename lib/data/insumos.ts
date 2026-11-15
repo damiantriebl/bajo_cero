@@ -1,13 +1,12 @@
 import "server-only";
-import { ahora, leerStore, type Store } from "@/lib/mock/store";
+import { ahora, leerDb } from "@/lib/db";
 import { cantidadAPedir, estadoStock, type EstadoStock } from "@/lib/calculos";
+import { EMPRESA_DEFECTO } from "@/lib/empresa-defecto";
 import { aInputFecha } from "@/lib/fechas";
-import type { Insumo, MovimientoStock } from "@/lib/generated/prisma/client";
+import type { Prisma, PrismaClient } from "@/lib/generated/prisma/client";
 import type { TipoMovimiento, Unidad } from "@/lib/generated/prisma/enums";
 
 // Consultas de insumos y movimientos de stock.
-// Único lugar que lee el almacén para estas pantallas: al pasar a Prisma
-// se reemplaza el cuerpo de cada función y se mantienen los tipos.
 
 export type InsumoFila = {
   id: string;
@@ -40,9 +39,18 @@ export type MovimientoFila = {
 
 export type FiltroInsumos = "todos" | "bajo";
 
-/** Necesita reponerse: sin stock o por debajo del mínimo. */
-const necesitaReponer = (i: Pick<Insumo, "stock" | "stockMinimo">) => estadoStock(i) !== "ok";
+/** Movimientos que se muestran en la ficha de un insumo (los más recientes). */
+const HISTORIAL_FICHA = 200;
 
+/** Necesita reponerse: sin stock o por debajo del mínimo. */
+const necesitaReponer = (i: { stock: number; stockMinimo: number }) => estadoStock(i) !== "ok";
+
+/** Lo mismo que `necesitaReponer`, como filtro SQL (compara stock con la columna stockMinimo). */
+const dondeNecesitaReponer = (prisma: PrismaClient): Prisma.InsumoWhereInput => ({
+  OR: [{ stock: { lte: 0 } }, { stock: { lt: prisma.insumo.fields.stockMinimo } }],
+});
+
+/** Sin acentos ni mayúsculas: "Caño" encuentra "cano". */
 const normalizar = (t: string) =>
   t
     .normalize("NFD")
@@ -52,7 +60,40 @@ const normalizar = (t: string) =>
 
 const porNombre = (a: { nombre: string }, b: { nombre: string }) => a.nombre.localeCompare(b.nombre, "es");
 
-function aFila(s: Store, i: Insumo): InsumoFila {
+const selectInsumo = {
+  id: true,
+  nombre: true,
+  categoria: true,
+  unidad: true,
+  stock: true,
+  stockMinimo: true,
+  costoUnitario: true,
+  precioVenta: true,
+  proveedorId: true,
+  proveedor: { select: { nombre: true } },
+} satisfies Prisma.InsumoSelect;
+
+type InsumoConProveedor = Prisma.InsumoGetPayload<{ select: typeof selectInsumo }>;
+
+const selectMovimiento = {
+  id: true,
+  fecha: true,
+  tipo: true,
+  cantidad: true,
+  costoUnitario: true,
+  notas: true,
+  insumoId: true,
+  insumo: { select: { nombre: true, unidad: true } },
+  trabajo: { select: { id: true, numero: true, titulo: true, cliente: { select: { nombre: true } } } },
+  compra: { select: { id: true, proveedorId: true, numeroFactura: true, proveedor: { select: { nombre: true } } } },
+} satisfies Prisma.MovimientoStockSelect;
+
+type MovimientoConRelaciones = Prisma.MovimientoStockGetPayload<{ select: typeof selectMovimiento }>;
+
+/** Más reciente primero; el id desempata movimientos con la misma fecha. */
+const ordenMovimientos = [{ fecha: "desc" }, { id: "desc" }] satisfies Prisma.MovimientoStockOrderByWithRelationInput[];
+
+function aFila(i: InsumoConProveedor): InsumoFila {
   return {
     id: i.id,
     nombre: i.nombre,
@@ -63,15 +104,12 @@ function aFila(s: Store, i: Insumo): InsumoFila {
     costoUnitario: i.costoUnitario,
     precioVenta: i.precioVenta,
     proveedorId: i.proveedorId,
-    proveedorNombre: s.proveedores.find((p) => p.id === i.proveedorId)?.nombre ?? null,
+    proveedorNombre: i.proveedor?.nombre ?? null,
     estado: estadoStock(i),
   };
 }
 
-function aMovimientoFila(s: Store, m: MovimientoStock): MovimientoFila {
-  const insumo = s.insumos.find((i) => i.id === m.insumoId);
-  const trabajo = m.trabajoId ? s.trabajos.find((t) => t.id === m.trabajoId) : undefined;
-  const compra = m.compraId ? s.compras.find((c) => c.id === m.compraId) : undefined;
+function aMovimientoFila(m: MovimientoConRelaciones): MovimientoFila {
   return {
     id: m.id,
     fecha: m.fecha,
@@ -80,33 +118,29 @@ function aMovimientoFila(s: Store, m: MovimientoStock): MovimientoFila {
     costoUnitario: m.costoUnitario,
     notas: m.notas,
     insumoId: m.insumoId,
-    insumoNombre: insumo?.nombre ?? "Insumo borrado",
-    unidad: insumo?.unidad ?? "UNIDAD",
-    trabajo: trabajo
-      ? {
-          id: trabajo.id,
-          numero: trabajo.numero,
-          titulo: trabajo.titulo,
-          clienteNombre: s.clientes.find((c) => c.id === trabajo.clienteId)?.nombre ?? null,
-        }
+    insumoNombre: m.insumo.nombre,
+    unidad: m.insumo.unidad,
+    trabajo: m.trabajo
+      ? { id: m.trabajo.id, numero: m.trabajo.numero, titulo: m.trabajo.titulo, clienteNombre: m.trabajo.cliente.nombre }
       : null,
-    compra: compra
+    compra: m.compra
       ? {
-          id: compra.id,
-          proveedorId: compra.proveedorId,
-          proveedorNombre: s.proveedores.find((p) => p.id === compra.proveedorId)?.nombre ?? "Proveedor",
-          numeroFactura: compra.numeroFactura,
+          id: m.compra.id,
+          proveedorId: m.compra.proveedorId,
+          proveedorNombre: m.compra.proveedor.nombre,
+          numeroFactura: m.compra.numeroFactura,
         }
       : null,
   };
 }
 
-const masRecientePrimeroMov = (a: MovimientoStock, b: MovimientoStock) => b.fecha.getTime() - a.fecha.getTime();
-
 /** Listado de /insumos: búsqueda por nombre o categoría + filtro de stock bajo. */
 export async function listarInsumos({ q, filtro }: { q: string; filtro: FiltroInsumos }) {
-  const s = await leerStore();
-  const activos = s.insumos.filter((i) => i.activo);
+  const prisma = await leerDb();
+  // El catálogo de insumos es chico (cientos como mucho): se trae entero en una consulta
+  // y se filtra acá, así la búsqueda ignora acentos y salen todos los contadores juntos.
+  const activos = await prisma.insumo.findMany({ where: { activo: true }, select: selectInsumo });
+
   const texto = normalizar(q);
   const encontrados = texto
     ? activos.filter((i) => normalizar(`${i.nombre} ${i.categoria ?? ""}`).includes(texto))
@@ -119,7 +153,7 @@ export async function listarInsumos({ q, filtro }: { q: string; filtro: FiltroIn
   const visibles = filtro === "bajo" ? ordenados.filter(necesitaReponer) : ordenados;
 
   return {
-    insumos: visibles.map((i) => aFila(s, i)),
+    insumos: visibles.map(aFila),
     cantidadTodos: encontrados.length,
     cantidadBajo: encontrados.filter(necesitaReponer).length,
     /** Total sin búsqueda, para el aviso de "bajo el mínimo". */
@@ -130,29 +164,49 @@ export async function listarInsumos({ q, filtro }: { q: string; filtro: FiltroIn
 
 /** Últimos movimientos de stock de todos los insumos (vista "Movimientos"). */
 export async function movimientosRecientes({ q, limite = 60 }: { q: string; limite?: number }) {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const texto = normalizar(q);
-  const movs = [...s.movimientos].sort(masRecientePrimeroMov).map((m) => aMovimientoFila(s, m));
-  const filtrados = texto ? movs.filter((m) => normalizar(m.insumoNombre).includes(texto)) : movs;
-  return { movimientos: filtrados.slice(0, limite), hoy: ahora() };
+
+  let where: Prisma.MovimientoStockWhereInput | undefined;
+  if (texto) {
+    // Insumos cuyo nombre coincide (sin acentos), incluidos los dados de baja.
+    const insumos = await prisma.insumo.findMany({ select: { id: true, nombre: true } });
+    const ids = insumos.filter((i) => normalizar(i.nombre).includes(texto)).map((i) => i.id);
+    if (ids.length === 0) return { movimientos: [] as MovimientoFila[], hoy: ahora() };
+    where = { insumoId: { in: ids } };
+  }
+
+  const movimientos = await prisma.movimientoStock.findMany({
+    where,
+    orderBy: ordenMovimientos,
+    take: limite,
+    select: selectMovimiento,
+  });
+  return { movimientos: movimientos.map(aMovimientoFila), hoy: ahora() };
 }
 
-/** Ficha de un insumo con su historial. `null` si no existe. */
+/** Ficha de un insumo con su historial (los últimos movimientos). `null` si no existe. */
 export async function obtenerInsumo(id: string) {
-  const s = await leerStore();
-  const insumo = s.insumos.find((i) => i.id === id);
+  const prisma = await leerDb();
+  const [insumo, movimientos] = await Promise.all([
+    prisma.insumo.findUnique({
+      where: { id },
+      select: { ...selectInsumo, proveedor: { select: { id: true, nombre: true, telefono: true } } },
+    }),
+    prisma.movimientoStock.findMany({
+      where: { insumoId: id },
+      orderBy: ordenMovimientos,
+      take: HISTORIAL_FICHA,
+      select: selectMovimiento,
+    }),
+  ]);
   if (!insumo) return null;
-  const proveedor = insumo.proveedorId ? s.proveedores.find((p) => p.id === insumo.proveedorId) : undefined;
-  const movimientos = s.movimientos
-    .filter((m) => m.insumoId === id)
-    .sort(masRecientePrimeroMov)
-    .map((m) => aMovimientoFila(s, m));
   return {
-    ...aFila(s, insumo),
+    ...aFila(insumo),
     /** Cantidad sugerida para el próximo pedido (0 si hay stock suficiente). */
     aPedir: cantidadAPedir(insumo),
-    proveedor: proveedor ? { id: proveedor.id, nombre: proveedor.nombre, telefono: proveedor.telefono } : null,
-    movimientos,
+    proveedor: insumo.proveedor,
+    movimientos: movimientos.map(aMovimientoFila),
     hoy: ahora(),
   };
 }
@@ -161,8 +215,9 @@ export type InsumoDetalle = NonNullable<Awaited<ReturnType<typeof obtenerInsumo>
 
 /** Categorías ya usadas, para sugerirlas en el formulario. */
 export async function categoriasInsumos(): Promise<string[]> {
-  const s = await leerStore();
-  const set = new Set(s.insumos.map((i) => i.categoria?.trim()).filter((c): c is string => Boolean(c)));
+  const prisma = await leerDb();
+  const filas = await prisma.insumo.groupBy({ by: ["categoria"], where: { categoria: { not: null } } });
+  const set = new Set(filas.map((f) => f.categoria?.trim()).filter((c): c is string => Boolean(c)));
   return [...set].sort((a, b) => a.localeCompare(b, "es"));
 }
 
@@ -176,11 +231,12 @@ export type OpcionInsumo = {
 
 /** Insumos activos para elegir en una compra. */
 export async function opcionesInsumos(): Promise<OpcionInsumo[]> {
-  const s = await leerStore();
-  return s.insumos
-    .filter((i) => i.activo)
-    .sort(porNombre)
-    .map((i) => ({ id: i.id, nombre: i.nombre, unidad: i.unidad, costoUnitario: i.costoUnitario, proveedorId: i.proveedorId }));
+  const prisma = await leerDb();
+  const insumos = await prisma.insumo.findMany({
+    where: { activo: true },
+    select: { id: true, nombre: true, unidad: true, costoUnitario: true, proveedorId: true },
+  });
+  return insumos.sort(porNombre);
 }
 
 export type ItemPedido = {
@@ -203,23 +259,34 @@ export type GrupoPedido = {
 
 /** Insumos bajo el mínimo agrupados por proveedor habitual ("Sin proveedor" al final). */
 export async function pedidoSugerido() {
-  const s = await leerStore();
-  const grupos = new Map<string | null, GrupoPedido>();
+  const prisma = await leerDb();
+  const [insumos, empresa] = await Promise.all([
+    prisma.insumo.findMany({
+      where: { activo: true, ...dondeNecesitaReponer(prisma) },
+      select: {
+        id: true,
+        nombre: true,
+        unidad: true,
+        stock: true,
+        stockMinimo: true,
+        costoUnitario: true,
+        proveedor: { select: { id: true, nombre: true, contacto: true, telefono: true } },
+      },
+    }),
+    prisma.empresa.findUnique({ where: { id: EMPRESA_DEFECTO.id }, select: { nombreFantasia: true } }),
+  ]);
 
-  for (const i of s.insumos.filter((x) => x.activo && necesitaReponer(x)).sort(porNombre)) {
-    const prov = i.proveedorId ? s.proveedores.find((p) => p.id === i.proveedorId) : undefined;
-    const clave = prov?.id ?? null;
-    if (!grupos.has(clave)) {
-      grupos.set(clave, {
-        proveedor: prov ? { id: prov.id, nombre: prov.nombre, contacto: prov.contacto, telefono: prov.telefono } : null,
-        items: [],
-        total: 0,
-      });
+  const grupos = new Map<string | null, GrupoPedido>();
+  for (const i of insumos.sort(porNombre)) {
+    const clave = i.proveedor?.id ?? null;
+    let g = grupos.get(clave);
+    if (!g) {
+      g = { proveedor: i.proveedor, items: [], total: 0 };
+      grupos.set(clave, g);
     }
     // Sin mínimo cargado (stock 0, mínimo 0) la regla da 0: sugerimos al menos 1.
     const sugerida = Math.max(1, cantidadAPedir(i));
     const costoEstimado = Math.round(sugerida * i.costoUnitario);
-    const g = grupos.get(clave)!;
     g.items.push({
       id: i.id,
       nombre: i.nombre,
@@ -239,20 +306,23 @@ export async function pedidoSugerido() {
     if (!b.proveedor) return -1;
     return a.proveedor.nombre.localeCompare(b.proveedor.nombre, "es");
   });
-  return { grupos: lista, empresa: s.empresa.nombreFantasia };
+  return { grupos: lista, empresa: empresa?.nombreFantasia ?? EMPRESA_DEFECTO.nombreFantasia };
 }
 
 /** Ítems sugeridos para precargar una compra a partir del pedido de un proveedor. */
 export async function itemsPedidoDeProveedor(proveedorId: string) {
-  const s = await leerStore();
-  return s.insumos
-    .filter((i) => i.activo && i.proveedorId === proveedorId && necesitaReponer(i))
+  const prisma = await leerDb();
+  const insumos = await prisma.insumo.findMany({
+    where: { activo: true, proveedorId, ...dondeNecesitaReponer(prisma) },
+    select: { id: true, nombre: true, stock: true, stockMinimo: true, costoUnitario: true },
+  });
+  return insumos
     .sort(porNombre)
     .map((i) => ({ insumoId: i.id, descripcion: i.nombre, cantidad: Math.max(1, cantidadAPedir(i)), precioUnitario: i.costoUnitario }));
 }
 
-/** Fecha de hoy para <input type="date">, calculada después de leer el almacén. */
+/** Fecha de hoy para <input type="date">, calculada después de abrir la lectura. */
 export async function hoyInputFecha(): Promise<string> {
-  await leerStore();
+  await leerDb();
   return aInputFecha(ahora());
 }

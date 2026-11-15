@@ -1,5 +1,6 @@
 import "server-only";
-import { leerStore } from "@/lib/mock/store";
+import { leerDb } from "@/lib/db";
+import { EMPRESA_DEFECTO } from "@/lib/empresa-defecto";
 
 export type DatosEmpresa = {
   razonSocial: string;
@@ -13,10 +14,27 @@ export type DatosEmpresa = {
   validezPresupuestoDias: number;
 };
 
-/** Datos de la empresa (encabezan el presupuesto impreso y el cierre del mes). */
+/**
+ * Datos de la empresa (encabezan el presupuesto impreso y el cierre del mes).
+ * Mientras no se guardaron en Ajustes no hay fila: se usan los de EMPRESA_DEFECTO.
+ */
 export async function datosEmpresa(): Promise<DatosEmpresa> {
-  const s = await leerStore();
-  const e = s.empresa;
+  const prisma = await leerDb();
+  const e =
+    (await prisma.empresa.findUnique({
+      where: { id: EMPRESA_DEFECTO.id },
+      select: {
+        razonSocial: true,
+        nombreFantasia: true,
+        cuit: true,
+        telefono: true,
+        email: true,
+        direccion: true,
+        condicionesPresupuesto: true,
+        garantia: true,
+        validezPresupuestoDias: true,
+      },
+    })) ?? EMPRESA_DEFECTO;
   return {
     razonSocial: e.razonSocial,
     nombreFantasia: e.nombreFantasia,

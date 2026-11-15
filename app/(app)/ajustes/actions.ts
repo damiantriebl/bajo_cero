@@ -2,7 +2,9 @@
 
 import { refresh } from "next/cache";
 import { z } from "zod";
-import { storeParaAcciones } from "@/lib/mock/store";
+import { db } from "@/lib/db";
+import { EMPRESA_DEFECTO } from "@/lib/empresa-defecto";
+import { Prisma } from "@/lib/generated/prisma/client";
 import { datosDe, erroresDeZod, zTexto, zTextoOpcional } from "@/lib/forms";
 import type { EstadoConValores } from "../gastos/_components/estado-form";
 
@@ -34,13 +36,30 @@ export async function guardarEmpresa(_prev: EstadoConValores, formData: FormData
   if (!r.success) return { ...erroresDeZod(r.error), valores };
 
   const d = r.data;
-  const empresa = storeParaAcciones().empresa;
-  Object.assign(empresa, {
+  const datos = {
     ...d,
     cuit: d.cuit ? formatoCuit(d.cuit) : null,
     // Respetar los saltos de línea de Windows/Android como "\n".
     condicionesPresupuesto: d.condicionesPresupuesto?.replace(/\r\n/g, "\n") ?? null,
-  });
+  };
+
+  // Producción arranca sin la fila "empresa": la primera vez se crea, después se actualiza.
+  let empresa: { cuit: string | null };
+  try {
+    empresa = await db().empresa.upsert({
+      where: { id: EMPRESA_DEFECTO.id },
+      create: { id: EMPRESA_DEFECTO.id, ...datos },
+      update: datos,
+      select: { cuit: true },
+    });
+  } catch (e) {
+    // Dos guardados a la vez la primera vez: el segundo choca con la fila recién creada.
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+      return { error: "Se guardó otro cambio al mismo tiempo. Probá de nuevo.", valores };
+    }
+    throw e;
+  }
+
   refresh();
   return {
     ok: "Guardado. Los próximos presupuestos ya salen con estos datos.",

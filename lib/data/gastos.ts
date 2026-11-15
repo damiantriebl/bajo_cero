@@ -1,10 +1,11 @@
 import "server-only";
-import { ahora, leerStore, type Store } from "@/lib/mock/store";
+import { ahora, leerDb } from "@/lib/db";
 import { aInputFecha } from "@/lib/fechas";
 import { sumaMontos } from "@/lib/calculos";
 import { CATEGORIA_GASTO, MEDIO_PAGO } from "@/lib/etiquetas";
+import type { PrismaClient } from "@/lib/generated/prisma/client";
 import type { CategoriaGasto, EstadoTrabajo, MedioPago } from "@/lib/generated/prisma/enums";
-import { delPeriodo, porCategoria, resolverMes, type CategoriaResumen, type MesInfo } from "./reportes";
+import { enRango, gastosPorCategoria, resolverMes, type CategoriaResumen, type MesInfo } from "./reportes";
 
 export type GastoFila = {
   id: string;
@@ -35,32 +36,39 @@ export function esCategoria(v: string | undefined): v is CategoriaGasto {
 }
 
 export async function gastosDelMes(clave: string | undefined, categoria: string | undefined): Promise<GastosDelMes> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const { info, desde, hasta } = resolverMes(clave, ahora());
-  const delMes = delPeriodo(s.gastos, desde, hasta);
-  const total = sumaMontos(delMes);
-  const cobrado = sumaMontos(delPeriodo(s.cobros, desde, hasta));
+  const delMes = enRango(desde, hasta);
   const filtro = esCategoria(categoria) ? categoria : null;
 
-  const gastos = delMes
-    .filter((g) => !filtro || g.categoria === filtro)
-    .sort((a, b) => b.fecha.getTime() - a.fecha.getTime() || b.createdAt.getTime() - a.createdAt.getTime())
-    .map((g) => ({
-      id: g.id,
-      fecha: g.fecha,
-      descripcion: g.descripcion,
-      categoria: g.categoria,
-      categoriaLabel: CATEGORIA_GASTO[g.categoria],
-      medioLabel: MEDIO_PAGO[g.medio],
-      monto: g.monto,
-    }));
+  const [porCategoria, cobros, filas] = await Promise.all([
+    gastosPorCategoria(prisma, desde, hasta),
+    prisma.cobro.aggregate({ where: { fecha: delMes }, _sum: { monto: true } }),
+    prisma.gasto.findMany({
+      where: { fecha: delMes, categoria: filtro ?? undefined },
+      orderBy: [{ fecha: "desc" }, { createdAt: "desc" }, { id: "asc" }],
+      select: { id: true, fecha: true, descripcion: true, categoria: true, medio: true, monto: true },
+    }),
+  ]);
+
+  const total = sumaMontos(porCategoria);
+  const cobrado = cobros._sum.monto ?? 0;
+  const gastos = filas.map((g) => ({
+    id: g.id,
+    fecha: g.fecha,
+    descripcion: g.descripcion,
+    categoria: g.categoria,
+    categoriaLabel: CATEGORIA_GASTO[g.categoria],
+    medioLabel: MEDIO_PAGO[g.medio],
+    monto: g.monto,
+  }));
 
   return {
     mes: info,
     total,
     cobrado,
     quedan: cobrado - total,
-    porCategoria: porCategoria(delMes),
+    porCategoria,
     categoria: filtro,
     gastos,
     totalFiltrado: sumaMontos(gastos),
@@ -87,12 +95,24 @@ export type GastoDetalle = {
 };
 
 export async function detalleGasto(id: string): Promise<GastoDetalle | null> {
-  const s = await leerStore();
-  const g = s.gastos.find((x) => x.id === id);
+  const prisma = await leerDb();
+  const g = await prisma.gasto.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      fecha: true,
+      descripcion: true,
+      categoria: true,
+      medio: true,
+      monto: true,
+      notas: true,
+      compraId: true,
+      empleado: { select: { id: true, nombre: true } },
+      trabajo: { select: { id: true, numero: true, titulo: true } },
+      proveedor: { select: { id: true, nombre: true } },
+    },
+  });
   if (!g) return null;
-  const empleado = g.empleadoId ? s.empleados.find((e) => e.id === g.empleadoId) : undefined;
-  const trabajo = g.trabajoId ? s.trabajos.find((t) => t.id === g.trabajoId) : undefined;
-  const proveedor = g.proveedorId ? s.proveedores.find((p) => p.id === g.proveedorId) : undefined;
   return {
     id: g.id,
     fecha: g.fecha,
@@ -104,9 +124,9 @@ export async function detalleGasto(id: string): Promise<GastoDetalle | null> {
     medioLabel: MEDIO_PAGO[g.medio],
     monto: g.monto,
     notas: g.notas,
-    empleado: empleado ? { id: empleado.id, nombre: empleado.nombre } : null,
-    trabajo: trabajo ? { id: trabajo.id, numero: trabajo.numero, titulo: trabajo.titulo } : null,
-    proveedor: proveedor ? { id: proveedor.id, nombre: proveedor.nombre } : null,
+    empleado: g.empleado,
+    trabajo: g.trabajo,
+    proveedor: g.proveedor,
     esCompra: g.compraId !== null,
   };
 }
@@ -118,14 +138,13 @@ const ESTADOS_ACTIVOS: EstadoTrabajo[] = ["APROBADO", "EN_CURSO", "TERMINADO"];
 export type OpcionTrabajo = { id: string; label: string };
 
 /** Trabajos a los que se les puede asociar un gasto o una jornada. */
-export function trabajosActivos(s: Store): OpcionTrabajo[] {
-  return s.trabajos
-    .filter((t) => ESTADOS_ACTIVOS.includes(t.estado))
-    .sort((a, b) => b.numero - a.numero)
-    .map((t) => {
-      const cliente = s.clientes.find((c) => c.id === t.clienteId)?.nombre ?? "Cliente";
-      return { id: t.id, label: `#${t.numero} · ${cliente} · ${t.titulo}` };
-    });
+export async function trabajosActivos(prisma: PrismaClient): Promise<OpcionTrabajo[]> {
+  const trabajos = await prisma.trabajo.findMany({
+    where: { estado: { in: ESTADOS_ACTIVOS } },
+    orderBy: { numero: "desc" },
+    select: { id: true, numero: true, titulo: true, cliente: { select: { nombre: true } } },
+  });
+  return trabajos.map((t) => ({ id: t.id, label: `#${t.numero} · ${t.cliente.nombre} · ${t.titulo}` }));
 }
 
 export type OpcionesGasto = {
@@ -136,10 +155,14 @@ export type OpcionesGasto = {
 };
 
 export async function opcionesNuevoGasto(): Promise<OpcionesGasto> {
-  const s = await leerStore();
+  const prisma = await leerDb();
+  const [empleados, trabajos] = await Promise.all([
+    prisma.empleado.findMany({ where: { activo: true }, select: { id: true, nombre: true } }),
+    trabajosActivos(prisma),
+  ]);
   return {
-    empleados: s.empleados.filter((e) => e.activo).map((e) => ({ id: e.id, nombre: e.nombre })),
-    trabajos: trabajosActivos(s),
+    empleados: empleados.sort((a, b) => a.nombre.localeCompare(b.nombre, "es")),
+    trabajos,
     hoy: aInputFecha(ahora()),
   };
 }

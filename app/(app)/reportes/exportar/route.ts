@@ -8,7 +8,10 @@ import { partesAR } from "@/lib/fechas";
 const SEP = ";";
 
 function celda(v: string | number): string {
-  const s = String(v);
+  let s = String(v);
+  // Evita que Excel interprete un texto cargado por el usuario como fórmula
+  // (ej. un cliente llamado "=HYPERLINK(...)"). Los montos numéricos no se tocan.
+  if (typeof v === "string" && /^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   return /[";\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 

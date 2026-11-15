@@ -1,6 +1,6 @@
 // Fábricas que arman registros con la MISMA forma que devuelve Prisma
 // (todos los campos, con los mismos defaults que schema.prisma).
-// Se usan en los datos de ejemplo y en las server actions mientras no haya base.
+// Se usan para armar los datos de ejemplo de la rama "desarrollo" (prisma/seed.ts).
 import type {
   ChecklistItem,
   Cliente,

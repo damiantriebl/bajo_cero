@@ -1,9 +1,10 @@
 import "server-only";
-import type { CategoriaGasto, EstadoTrabajo, TipoEquipo, Unidad } from "@/lib/generated/prisma/enums";
-import { ahora, leerStore, type Store } from "@/lib/mock/store";
-import { diasHasta, entre, finDia, finMes, inicioDia, inicioMes, mismoDia, sumarDias, sumarMeses } from "@/lib/fechas";
-import { estadoStock, saldo, sumaMontos, totalItems } from "@/lib/calculos";
-import { armarVisitas, trabajosSinFecha, turnosDelDia, type Visita } from "./agenda";
+import { Prisma, type PrismaClient } from "@/lib/generated/prisma/client";
+import type { CategoriaGasto, EstadoTrabajo, EstadoTurno, TipoEquipo, Unidad } from "@/lib/generated/prisma/enums";
+import { ahora, leerDb } from "@/lib/db";
+import { diasHasta, finDia, finMes, inicioDia, inicioMes, partesAR, sumarDias, sumarMeses } from "@/lib/fechas";
+import { estadoStock, saldo, sumaMontos } from "@/lib/calculos";
+import { ORDEN_VISITAS, SELECT_VISITA, aVisita, whereSinFecha, type Visita } from "./agenda";
 
 // Datos del inicio (tablero): visitas de hoy, números del mes y avisos.
 
@@ -64,187 +65,352 @@ export type DatosInicio = {
 };
 
 const CON_SALDO: EstadoTrabajo[] = ["APROBADO", "EN_CURSO", "TERMINADO", "COBRADO"];
+const PENDIENTES: EstadoTurno[] = ["A_CONFIRMAR", "CONFIRMADO"];
 const DIAS_BUSQUEDA = 60;
 
-function cobradoYGastos(s: Store, desde: Date, hasta: Date) {
-  const cobros = s.cobros.filter((c) => entre(c.fecha, desde, hasta));
-  const gastos = s.gastos.filter((g) => entre(g.fecha, desde, hasta));
-  return { cobros, gastos, cobrado: sumaMontos(cobros), gastado: sumaMontos(gastos) };
+// Avisos: cuántos días antes avisar.
+const DIAS_PRESUPUESTO = 3;
+const DIAS_MANTENIMIENTO = 15;
+const DIAS_PAGO = 7;
+
+/** "2026-10" → para juntar cobros y gastos por mes (en Argentina). */
+function claveMes(d: Date): string {
+  const p = partesAR(d);
+  return `${p.anio}-${p.mes}`;
 }
 
-function cuentasPorCobrar(s: Store, hoy: Date): CuentaPorCobrar[] {
-  const esperan = new Set(trabajosSinFecha(s, hoy).map((t) => t.id));
-  return s.trabajos
-    .filter((t) => CON_SALDO.includes(t.estado))
-    .map((t) => {
-      const total = totalItems(s.items.filter((i) => i.trabajoId === t.id));
-      const cobrado = sumaMontos(s.cobros.filter((c) => c.trabajoId === t.id));
-      const cliente = s.clientes.find((c) => c.id === t.clienteId);
+// ───────── Visitas ─────────
+
+/** La próxima visita pendiente (en curso o por empezar) y las demás pendientes de ese mismo día. */
+async function proximasVisitas(prisma: PrismaClient, momento: Date, limite: Date) {
+  const pendiente = { estado: { in: PENDIENTES }, fin: { gt: momento } } satisfies Prisma.TurnoWhereInput;
+  const primera = await prisma.turno.findFirst({
+    where: { ...pendiente, inicio: { lt: limite } },
+    select: SELECT_VISITA,
+    orderBy: ORDEN_VISITAS,
+  });
+  if (!primera) return { proxima: null, despues: [] };
+
+  const despues = await prisma.turno.findMany({
+    where: {
+      ...pendiente,
+      id: { not: primera.id },
+      inicio: { gte: inicioDia(primera.inicio), lte: finDia(primera.inicio), lt: limite },
+    },
+    select: SELECT_VISITA,
+    orderBy: ORDEN_VISITAS,
+  });
+  return { proxima: aVisita(primera), despues: despues.map(aVisita) };
+}
+
+/** Próximo día (después de hoy) con visitas no canceladas, y cuántas hay. */
+async function siguienteDiaConVisitas(prisma: PrismaClient, hoy: Date, limite: Date) {
+  const activa = { estado: { not: "CANCELADO" } } satisfies Prisma.TurnoWhereInput;
+  const primera = await prisma.turno.findFirst({
+    where: { ...activa, inicio: { gt: finDia(hoy), lt: limite } },
+    select: { inicio: true },
+    orderBy: { inicio: "asc" },
+  });
+  if (!primera) return null;
+
+  const fecha = inicioDia(primera.inicio);
+  const cantidad = await prisma.turno.count({
+    where: { ...activa, inicio: { gte: fecha, lte: finDia(fecha), lt: limite } },
+  });
+  return { fecha, cantidad };
+}
+
+// ───────── Plata ─────────
+
+/** Cobros y gastos de los últimos 6 meses, agrupados por fecha (se reparten por mes en JS). */
+function plataDelSemestre(prisma: PrismaClient, desde: Date, hasta: Date) {
+  const fecha = { gte: desde, lte: hasta };
+  return Promise.all([
+    prisma.cobro.groupBy({ by: ["fecha"], where: { fecha }, _sum: { monto: true }, _count: { _all: true } }),
+    prisma.gasto.groupBy({ by: ["fecha", "categoria"], where: { fecha }, _sum: { monto: true } }),
+  ]);
+}
+
+type FilaCuenta = {
+  id: string;
+  numero: number;
+  titulo: string;
+  estado: EstadoTrabajo;
+  clienteId: string;
+  cliente: string;
+  /** Σ cantidad × precio de los ítems, sin redondear. */
+  presupuesto: number;
+  cobrado: number;
+};
+
+/**
+ * Trabajos con plata pendiente. Las sumas (ítems y cobros) y el filtro se hacen
+ * en la base para no traer todo el historial de trabajos cobrados; el saldo
+ * final se calcula con las mismas reglas de lib/calculos.
+ */
+async function cuentasPorCobrar(prisma: PrismaClient): Promise<Omit<CuentaPorCobrar, "faltaAgendar">[]> {
+  const filas = await prisma.$queryRaw<FilaCuenta[]>`
+    SELECT t."id", t."numero", t."titulo", t."estado"::text AS "estado", t."clienteId", c."nombre" AS "cliente",
+           COALESCE(i."suma", 0)::float8 AS "presupuesto", COALESCE(co."suma", 0)::float8 AS "cobrado"
+    FROM "Trabajo" t
+    JOIN "Cliente" c ON c."id" = t."clienteId"
+    LEFT JOIN LATERAL (
+      SELECT SUM(it."cantidad" * it."precioUnitario") AS "suma" FROM "ItemTrabajo" it WHERE it."trabajoId" = t."id"
+    ) i ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT SUM(cb."monto") AS "suma" FROM "Cobro" cb WHERE cb."trabajoId" = t."id"
+    ) co ON TRUE
+    WHERE t."estado"::text IN (${Prisma.join(CON_SALDO)})
+      AND COALESCE(i."suma", 0) > COALESCE(co."suma", 0)
+  `;
+
+  return filas
+    .map((f) => {
+      // Mismo redondeo que totalItems(): se suma todo y se redondea una vez.
+      const total = Math.round(f.presupuesto);
       return {
-        trabajoId: t.id,
-        numero: t.numero,
-        titulo: t.titulo,
-        estado: t.estado,
-        faltaAgendar: t.estado === "APROBADO" && esperan.has(t.id),
-        clienteId: t.clienteId,
-        cliente: cliente?.nombre ?? "",
+        trabajoId: f.id,
+        numero: f.numero,
+        titulo: f.titulo,
+        estado: f.estado,
+        clienteId: f.clienteId,
+        cliente: f.cliente,
         total,
-        cobrado,
-        saldo: saldo(total, cobrado),
+        cobrado: f.cobrado,
+        saldo: saldo(total, f.cobrado),
       };
     })
     .filter((c) => c.saldo > 0)
-    .sort((a, b) => b.saldo - a.saldo);
+    .sort((a, b) => b.saldo - a.saldo || a.numero - b.numero);
 }
 
-function alertas(s: Store, momento: Date): Alerta[] {
+// ───────── Avisos ─────────
+
+type FilaFacturaImpaga = { proveedorId: string; proveedor: string; deuda: number; vencimiento: Date };
+
+/**
+ * Facturas de proveedores impagas que tienen vencimiento.
+ * Deuda del proveedor = compras − pagos. Para saber QUÉ compras siguen impagas:
+ * 1. Lo pagado con `compraId` se descuenta de esa compra (dato exacto).
+ * 2. Los pagos a cuenta (sin compra) saldan las compras más viejas primero, así
+ *    que la deuda que queda está en las compras más nuevas: se recorren de la más
+ *    nueva a la más vieja hasta cubrir la deuda (ventana `posteriores`).
+ * Todo se calcula en la base: devuelve solo las facturas impagas con vencimiento.
+ */
+function facturasImpagas(prisma: PrismaClient) {
+  return prisma.$queryRaw<FilaFacturaImpaga[]>`
+    WITH "pagado" AS (
+      SELECT "compraId", SUM("monto") AS "monto" FROM "PagoProveedor" WHERE "compraId" IS NOT NULL GROUP BY "compraId"
+    ),
+    "deudas" AS (
+      SELECT pr."id" AS "proveedorId", pr."nombre",
+             COALESCE((SELECT SUM(c."total") FROM "Compra" c WHERE c."proveedorId" = pr."id"), 0)
+           - COALESCE((SELECT SUM(p."monto") FROM "PagoProveedor" p WHERE p."proveedorId" = pr."id"), 0) AS "deuda"
+      FROM "Proveedor" pr
+    ),
+    "compras" AS (
+      SELECT c."id", c."proveedorId", c."vencimiento", d."nombre", d."deuda",
+             GREATEST(c."total" - COALESCE(pg."monto", 0), 0) AS "resto",
+             c."fecha"
+      FROM "Compra" c
+      JOIN "deudas" d ON d."proveedorId" = c."proveedorId" AND d."deuda" > 0
+      LEFT JOIN "pagado" pg ON pg."compraId" = c."id"
+    ),
+    "acumulado" AS (
+      SELECT *, SUM("resto") OVER (PARTITION BY "proveedorId" ORDER BY "fecha" DESC, "id" DESC) - "resto" AS "posteriores"
+      FROM "compras"
+    )
+    SELECT "proveedorId", "nombre" AS "proveedor", "deuda"::float8 AS "deuda", "vencimiento"
+    FROM "acumulado"
+    WHERE "resto" > 0 AND "posteriores" < "deuda" AND "vencimiento" IS NOT NULL
+  `;
+}
+
+async function alertas(prisma: PrismaClient, momento: Date): Promise<Alerta[]> {
   const hoy = inicioDia(momento);
+  // `diasHasta(fecha) <= n` ⇔ la fecha es antes del día n + 1 (00:00).
+  const hastaDia = (n: number) => sumarDias(hoy, n + 1);
+
+  const [insumos, presupuestos, equipos, facturas] = await Promise.all([
+    // Insumos activos por debajo del mínimo o sin stock.
+    prisma.insumo.findMany({
+      where: {
+        activo: true,
+        OR: [{ stock: { lte: 0 } }, { stock: { lt: prisma.insumo.fields.stockMinimo } }],
+      },
+      select: { id: true, nombre: true, stock: true, stockMinimo: true, unidad: true },
+    }),
+    // Presupuestos sin respuesta que vencen en los próximos días.
+    prisma.trabajo.findMany({
+      where: { estado: "PRESUPUESTO", validoHasta: { gte: hoy, lt: hastaDia(DIAS_PRESUPUESTO) } },
+      select: { id: true, numero: true, titulo: true, validoHasta: true, cliente: { select: { nombre: true } } },
+      orderBy: { numero: "asc" },
+    }),
+    // Equipos con mantenimiento vencido o cercano, salvo que el cliente ya
+    // tenga un mantenimiento agendado (a confirmar o confirmado, de hoy en adelante).
+    prisma.equipo.findMany({
+      where: {
+        proximoMantenimiento: { lt: hastaDia(DIAS_MANTENIMIENTO) },
+        cliente: {
+          trabajos: {
+            none: { tipo: "MANTENIMIENTO", turnos: { some: { estado: { in: PENDIENTES }, inicio: { gte: hoy } } } },
+          },
+        },
+      },
+      select: {
+        clienteId: true,
+        tipo: true,
+        frigorias: true,
+        ubicacion: true,
+        proximoMantenimiento: true,
+        cliente: { select: { nombre: true } },
+      },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    }),
+    facturasImpagas(prisma),
+  ]);
+
   const lista: Alerta[] = [];
 
-  // Insumos por debajo del mínimo (los más críticos primero).
-  s.insumos
-    .filter((i) => i.activo && estadoStock(i) !== "ok")
+  // Stock (los más críticos primero).
+  insumos
+    .filter((i) => estadoStock(i) !== "ok")
     .sort((a, b) => a.stock / (a.stockMinimo || 1) - b.stock / (b.stockMinimo || 1))
     .forEach((i) =>
       lista.push({ tipo: "stock", insumoId: i.id, nombre: i.nombre, stock: i.stock, stockMinimo: i.stockMinimo, unidad: i.unidad }),
     );
 
-  // Presupuestos sin respuesta que vencen en los próximos 3 días.
-  s.trabajos
-    .filter((t) => t.estado === "PRESUPUESTO" && t.validoHasta)
-    .map((t) => ({ t, dias: diasHasta(t.validoHasta as Date, momento) }))
-    .filter(({ dias }) => dias >= 0 && dias <= 3)
+  // Presupuestos por vencer.
+  presupuestos
+    .flatMap((t) => (t.validoHasta ? [{ t, dias: diasHasta(t.validoHasta, momento) }] : []))
+    .filter(({ dias }) => dias >= 0 && dias <= DIAS_PRESUPUESTO)
     .sort((a, b) => a.dias - b.dias)
     .forEach(({ t, dias }) =>
-      lista.push({
-        tipo: "presupuesto",
-        trabajoId: t.id,
-        numero: t.numero,
-        titulo: t.titulo,
-        cliente: s.clientes.find((c) => c.id === t.clienteId)?.nombre ?? "",
-        dias,
-      }),
+      lista.push({ tipo: "presupuesto", trabajoId: t.id, numero: t.numero, titulo: t.titulo, cliente: t.cliente.nombre, dias }),
     );
 
-  // Equipos con mantenimiento vencido o en los próximos 15 días,
-  // salvo que el cliente ya tenga un mantenimiento agendado.
-  const conMantenimientoAgendado = new Set(
-    s.turnos
-      .filter((t) => (t.estado === "A_CONFIRMAR" || t.estado === "CONFIRMADO") && t.inicio.getTime() >= hoy.getTime())
-      .map((t) => s.trabajos.find((x) => x.id === t.trabajoId))
-      .filter((t) => t?.tipo === "MANTENIMIENTO")
-      .map((t) => t!.clienteId),
-  );
-  const porCliente = new Map<string, { dias: number; equipos: (typeof s.equipos)[number][] }>();
-  for (const e of s.equipos) {
-    if (!e.proximoMantenimiento || conMantenimientoAgendado.has(e.clienteId)) continue;
+  // Mantenimientos, agrupados por cliente.
+  const porCliente = new Map<string, { cliente: string; dias: number; equipos: (typeof equipos)[number][] }>();
+  for (const e of equipos) {
+    if (!e.proximoMantenimiento) continue;
     const dias = diasHasta(e.proximoMantenimiento, momento);
-    if (dias > 15) continue;
-    const grupo = porCliente.get(e.clienteId) ?? { dias, equipos: [] };
+    if (dias > DIAS_MANTENIMIENTO) continue;
+    const grupo = porCliente.get(e.clienteId) ?? { cliente: e.cliente.nombre, dias, equipos: [] };
     grupo.dias = Math.min(grupo.dias, dias);
     grupo.equipos.push(e);
     porCliente.set(e.clienteId, grupo);
   }
   [...porCliente.entries()]
     .sort((a, b) => a[1].dias - b[1].dias)
-    .forEach(([clienteId, { dias, equipos }]) =>
+    .forEach(([clienteId, { cliente, dias, equipos: delCliente }]) =>
       lista.push({
         tipo: "mantenimiento",
         clienteId,
-        cliente: s.clientes.find((c) => c.id === clienteId)?.nombre ?? "",
-        equipos: equipos.map((e) => ({ tipo: e.tipo, frigorias: e.frigorias, ubicacion: e.ubicacion })),
+        cliente,
+        equipos: delCliente.map((e) => ({ tipo: e.tipo, frigorias: e.frigorias, ubicacion: e.ubicacion })),
         dias,
       }),
     );
 
-  // Facturas de proveedores que vencen en 7 días (o ya vencieron) con deuda pendiente.
-  s.proveedores
-    .map((p) => {
-      const deuda =
-        sumaMontos(s.compras.filter((c) => c.proveedorId === p.id).map((c) => ({ monto: c.total }))) -
-        sumaMontos(s.pagosProveedor.filter((x) => x.proveedorId === p.id));
-      const porVencer = s.compras.filter(
-        (c) => c.proveedorId === p.id && c.vencimiento && diasHasta(c.vencimiento, momento) <= 7,
-      );
-      const dias = Math.min(...porVencer.map((c) => diasHasta(c.vencimiento as Date, momento)));
-      return { p, deuda, facturas: porVencer.length, dias };
-    })
-    .filter((x) => x.deuda > 0 && x.facturas > 0)
-    .sort((a, b) => a.dias - b.dias)
-    .forEach(({ p, deuda, facturas, dias }) =>
-      lista.push({ tipo: "pago", proveedorId: p.id, proveedor: p.nombre, saldo: deuda, facturas, dias }),
-    );
+  // Facturas impagas de proveedores que vencen pronto (o ya vencieron).
+  const porProveedor = new Map<string, { proveedor: string; saldo: number; facturas: number; dias: number }>();
+  for (const f of facturas) {
+    const dias = diasHasta(f.vencimiento, momento);
+    if (dias > DIAS_PAGO) continue;
+    const grupo = porProveedor.get(f.proveedorId) ?? { proveedor: f.proveedor, saldo: f.deuda, facturas: 0, dias };
+    grupo.facturas += 1;
+    grupo.dias = Math.min(grupo.dias, dias);
+    porProveedor.set(f.proveedorId, grupo);
+  }
+  [...porProveedor.entries()]
+    .sort((a, b) => a[1].dias - b[1].dias)
+    .forEach(([proveedorId, g]) => lista.push({ tipo: "pago", proveedorId, ...g }));
 
   return lista;
 }
 
+// ───────── Consulta ─────────
+
 export async function obtenerInicio(): Promise<DatosInicio> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const momento = ahora();
   const hoy = inicioDia(momento);
-
-  // Visitas
-  const visitasHoy = armarVisitas(s, turnosDelDia(s, hoy)).filter((v) => v.estado !== "CANCELADO");
-  const limite = sumarDias(hoy, DIAS_BUSQUEDA).getTime();
-  const pendientes = armarVisitas(
-    s,
-    s.turnos.filter(
-      (t) =>
-        (t.estado === "A_CONFIRMAR" || t.estado === "CONFIRMADO") &&
-        t.fin.getTime() > momento.getTime() &&
-        t.inicio.getTime() < limite,
-    ),
-  );
-  const proxima = pendientes[0] ?? null;
-  const despues = proxima ? pendientes.slice(1).filter((v) => mismoDia(v.inicio, proxima.inicio)) : [];
-
-  const futuras = s.turnos.filter(
-    (t) => t.estado !== "CANCELADO" && t.inicio.getTime() > finDia(hoy).getTime() && t.inicio.getTime() < limite,
-  );
-  const primera = futuras.sort((a, b) => a.inicio.getTime() - b.inicio.getTime())[0];
-  const siguienteDia = primera
-    ? { fecha: inicioDia(primera.inicio), cantidad: futuras.filter((t) => mismoDia(t.inicio, primera.inicio)).length }
-    : null;
-
-  // Mes en curso
+  const limite = sumarDias(hoy, DIAS_BUSQUEDA);
   const desde = inicioMes(momento);
-  const mes = cobradoYGastos(s, desde, finMes(momento));
+  const meses6 = Array.from({ length: 6 }, (_, i) => inicioMes(sumarMeses(desde, i - 5)));
+
+  const [turnosHoy, { proxima, despues }, siguienteDia, esperanFecha, [cobros, gastos], cuentas, avisos] =
+    await Promise.all([
+      prisma.turno.findMany({
+        where: { inicio: { gte: hoy, lte: finDia(hoy) }, estado: { not: "CANCELADO" } },
+        select: SELECT_VISITA,
+        orderBy: ORDEN_VISITAS,
+      }),
+      proximasVisitas(prisma, momento, limite),
+      siguienteDiaConVisitas(prisma, hoy, limite),
+      prisma.trabajo.findMany({ where: whereSinFecha(hoy), select: { id: true } }),
+      plataDelSemestre(prisma, meses6[0], finMes(momento)),
+      cuentasPorCobrar(prisma),
+      alertas(prisma, momento),
+    ]);
+
+  // Cobrado y gastado por mes; gasto por categoría del mes en curso.
+  const cobradoPorMes = new Map<string, number>();
+  const gastoPorMes = new Map<string, number>();
+  for (const c of cobros) {
+    const k = claveMes(c.fecha);
+    cobradoPorMes.set(k, (cobradoPorMes.get(k) ?? 0) + (c._sum.monto ?? 0));
+  }
+  const mesActual = claveMes(desde);
+  let cantidadCobros = 0;
+  for (const c of cobros) if (claveMes(c.fecha) === mesActual) cantidadCobros += c._count._all;
+
   const porCategoria = new Map<CategoriaGasto, number>();
-  mes.gastos.forEach((g) => porCategoria.set(g.categoria, (porCategoria.get(g.categoria) ?? 0) + g.monto));
-  const [categoria, monto] = [...porCategoria.entries()].sort((a, b) => b[1] - a[1])[0] ?? [];
+  for (const g of gastos) {
+    const k = claveMes(g.fecha);
+    const monto = g._sum.monto ?? 0;
+    gastoPorMes.set(k, (gastoPorMes.get(k) ?? 0) + monto);
+    if (k === mesActual) porCategoria.set(g.categoria, (porCategoria.get(g.categoria) ?? 0) + monto);
+  }
+  const cobrado = cobradoPorMes.get(mesActual) ?? 0;
+  const gastado = gastoPorMes.get(mesActual) ?? 0;
+  const [categoria, montoCategoria] = [...porCategoria.entries()].sort((a, b) => b[1] - a[1])[0] ?? [];
 
-  // Últimos 6 meses
-  const meses = Array.from({ length: 6 }, (_, i) => {
-    const m = inicioMes(sumarMeses(desde, i - 5));
-    const r = cobradoYGastos(s, m, finMes(m));
-    return { mes: m, cobrado: r.cobrado, gastos: r.gastado };
-  });
+  const meses: MesResumen[] = meses6.map((m) => ({
+    mes: m,
+    cobrado: cobradoPorMes.get(claveMes(m)) ?? 0,
+    gastos: gastoPorMes.get(claveMes(m)) ?? 0,
+  }));
 
-  const cuentas = cuentasPorCobrar(s, hoy);
+  const esperan = new Set(esperanFecha.map((t) => t.id));
+  const conAgenda: CuentaPorCobrar[] = cuentas.map((c) => ({
+    ...c,
+    faltaAgendar: c.estado === "APROBADO" && esperan.has(c.trabajoId),
+  }));
 
   return {
     ahora: momento,
-    visitasHoy,
+    visitasHoy: turnosHoy.map(aVisita),
     proxima,
     despues,
     siguienteDia,
-    sinFecha: trabajosSinFecha(s, hoy).length,
+    sinFecha: esperan.size,
     mes: {
       inicio: desde,
-      cobrado: mes.cobrado,
-      cobros: mes.cobros.length,
-      gastos: mes.gastado,
-      ganancia: mes.cobrado - mes.gastado,
-      mayorGasto: categoria && mes.gastado > 0 ? { categoria, fraccion: (monto ?? 0) / mes.gastado } : null,
+      cobrado,
+      cobros: cantidadCobros,
+      gastos: gastado,
+      ganancia: cobrado - gastado,
+      mayorGasto: categoria && gastado > 0 ? { categoria, fraccion: (montoCategoria ?? 0) / gastado } : null,
     },
     porCobrar: {
-      total: sumaMontos(cuentas.map((c) => ({ monto: c.saldo }))),
-      presupuestado: sumaMontos(cuentas.map((c) => ({ monto: c.total }))),
-      cobrado: sumaMontos(cuentas.map((c) => ({ monto: c.cobrado }))),
-      clientes: new Set(cuentas.map((c) => c.clienteId)).size,
-      cuentas,
+      total: sumaMontos(conAgenda.map((c) => ({ monto: c.saldo }))),
+      presupuestado: sumaMontos(conAgenda.map((c) => ({ monto: c.total }))),
+      cobrado: sumaMontos(conAgenda.map((c) => ({ monto: c.cobrado }))),
+      clientes: new Set(conAgenda.map((c) => c.clienteId)).size,
+      cuentas: conAgenda,
     },
     meses,
-    alertas: alertas(s, momento),
+    alertas: avisos,
   };
 }

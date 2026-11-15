@@ -1,13 +1,11 @@
 import "server-only";
-import { ahora, leerStore, type Store } from "@/lib/mock/store";
+import { ahora, leerDb } from "@/lib/db";
 import { estadoStock, sumaMontos, type EstadoStock } from "@/lib/calculos";
 import { inicioDia } from "@/lib/fechas";
-import type { Compra, PagoProveedor } from "@/lib/generated/prisma/client";
+import type { Prisma, PrismaClient } from "@/lib/generated/prisma/client";
 import type { MedioPago, Unidad } from "@/lib/generated/prisma/enums";
 
 // Consultas de proveedores, compras y pagos.
-// Único lugar que lee el almacén para estas pantallas: al pasar a Prisma
-// se reemplaza el cuerpo de cada función y se mantienen los tipos.
 
 export type ProveedorFila = {
   id: string;
@@ -29,80 +27,146 @@ export type CompraFila = {
   vencimiento: Date | null;
   total: number;
   cantidadItems: number;
-  /** Lo que falta pagar de esta compra (estimado, ver `imputarPagos`). */
+  /** Lo que falta pagar de esta compra (ver `comprasImpagas`). */
   pendiente: number;
 };
 
-type CompraConPendiente = { compra: Compra; pendiente: number };
+/** Compras y pagos que se listan en la ficha de un proveedor (los más recientes). */
+const COMPRAS_FICHA = 100;
+const PAGOS_FICHA = 100;
+
+/** Compras más nuevas primero (createdAt e id desempatan las de la misma fecha). */
+const ordenCompras = [{ fecha: "desc" }, { createdAt: "desc" }, { id: "desc" }] satisfies Prisma.CompraOrderByWithRelationInput[];
+
+type CompraImpaga = { proveedorId: string; vencimiento: Date | null; pendiente: number };
+
+/** Compras leídas por tanda al buscar las impagas (casi siempre alcanza una). */
+const TANDA_IMPAGAS = 200;
+
+const selectCompraParaImputar = {
+  id: true,
+  proveedorId: true,
+  fecha: true,
+  createdAt: true,
+  total: true,
+  vencimiento: true,
+  /** Pagos atados a esta compra (compraId). */
+  pagos: { select: { monto: true } },
+} satisfies Prisma.CompraSelect;
+
+type CompraParaImputar = Prisma.CompraGetPayload<{ select: typeof selectCompraParaImputar }>;
 
 /**
- * Los pagos a proveedores no se atan a una compra puntual (PagoProveedor no
- * tiene compraId). Para saber qué compras siguen impagas (y su vencimiento):
- * 1. Un pago con la misma fecha exacta y el mismo monto que una compra es el
- *    "pagada en el momento" de esa compra y se le aplica a ella.
- * 2. El resto de los pagos se imputa a las compras más viejas primero (FIFO).
- * Es una aproximación: alcanza para mostrar "pagada / falta pagar" y el próximo
- * vencimiento sin pedir más datos al cargar un pago.
+ * Cuánto falta pagar de cada compra.
+ * - Un pago con `compraId` (p. ej. "pagada al comprar") se aplica a esa compra.
+ * - Los pagos sin compra ("a cuenta") cubren las compras más viejas primero (FIFO).
+ * Por eso, si un proveedor tiene saldo S > 0 (compras − pagos), lo impago son exactamente
+ * S pesos en sus compras MÁS NUEVAS: se recorren de la más nueva a la más vieja descontando
+ * de S lo que a cada una le falta después de sus propios pagos, hasta agotarlo.
+ * Así se leen solo esas pocas compras y no todo el historial. Las compras que no
+ * aparecen en el resultado están pagadas.
  */
-function imputarPagos(compras: Compra[], pagos: PagoProveedor[]): CompraConPendiente[] {
-  const ordenadas = [...compras].sort((a, b) => a.fecha.getTime() - b.fecha.getTime());
-  const usados = new Set<string>();
-  const alContado = new Set<string>();
-  for (const compra of ordenadas) {
-    const pago = pagos.find((p) => !usados.has(p.id) && p.monto === compra.total && p.fecha.getTime() === compra.fecha.getTime());
-    if (pago) {
-      usados.add(pago.id);
-      alContado.add(compra.id);
+async function comprasImpagas(prisma: PrismaClient, saldos: Map<string, number>): Promise<Map<string, CompraImpaga>> {
+  const restante = new Map([...saldos].filter(([, s]) => s > 0));
+  const impagas = new Map<string, CompraImpaga>();
+  let ultima: { fecha: Date; createdAt: Date; id: string } | null = null;
+
+  // Paginación por clave (de la más nueva a la más vieja) solo de los proveedores que
+  // todavía tienen saldo sin ubicar. No es una consulta por fila: corta en cuanto se agota.
+  while (restante.size > 0) {
+    const tanda: CompraParaImputar[] = await prisma.compra.findMany({
+      where: {
+        proveedorId: { in: [...restante.keys()] },
+        ...(ultima && {
+          OR: [
+            { fecha: { lt: ultima.fecha } },
+            { fecha: ultima.fecha, createdAt: { lt: ultima.createdAt } },
+            { fecha: ultima.fecha, createdAt: ultima.createdAt, id: { lt: ultima.id } },
+          ],
+        }),
+      },
+      orderBy: ordenCompras,
+      take: TANDA_IMPAGAS,
+      select: selectCompraParaImputar,
+    });
+
+    for (const c of tanda) {
+      const falta = restante.get(c.proveedorId);
+      if (!falta) continue;
+      const pendiente = Math.min(falta, Math.max(0, c.total - sumaMontos(c.pagos)));
+      if (pendiente > 0) impagas.set(c.id, { proveedorId: c.proveedorId, vencimiento: c.vencimiento, pendiente });
+      if (falta > pendiente) restante.set(c.proveedorId, falta - pendiente);
+      else restante.delete(c.proveedorId);
     }
+
+    if (tanda.length < TANDA_IMPAGAS) break;
+    const u = tanda[tanda.length - 1];
+    ultima = { fecha: u.fecha, createdAt: u.createdAt, id: u.id };
   }
-
-  let disponible = sumaMontos(pagos.filter((p) => !usados.has(p.id)));
-  return ordenadas.map((compra) => {
-    if (alContado.has(compra.id)) return { compra, pendiente: 0 };
-    const aplicado = Math.max(0, Math.min(disponible, compra.total));
-    disponible -= aplicado;
-    return { compra, pendiente: compra.total - aplicado };
-  });
+  return impagas;
 }
 
-function cuentaDe(s: Store, proveedorId: string, hoy: Date) {
-  const compras = s.compras.filter((c) => c.proveedorId === proveedorId);
-  const pagos = s.pagosProveedor.filter((p) => p.proveedorId === proveedorId);
-  const totalComprado = sumaMontos(compras.map((c) => ({ monto: c.total })));
-  const totalPagado = sumaMontos(pagos);
-  const imputadas = imputarPagos(compras, pagos);
+type Vencimientos = { proximoVencimiento: Date | null; vencida: boolean };
+
+/** Por proveedor: el vencimiento más cercano desde hoy y si hay alguno ya pasado (entre las impagas). */
+function vencimientosPorProveedor(impagas: Map<string, CompraImpaga>, hoy: Date): Map<string, Vencimientos> {
   const desdeHoy = inicioDia(hoy).getTime();
-
-  // Próximo vencimiento: el más cercano, desde hoy, entre las compras que siguen impagas.
-  const impagas = imputadas.filter((x) => x.pendiente > 0 && x.compra.vencimiento);
-  const proximoVencimiento =
-    impagas
-      .map((x) => x.compra.vencimiento as Date)
-      .filter((v) => v.getTime() >= desdeHoy)
-      .sort((a, b) => a.getTime() - b.getTime())[0] ?? null;
-  const vencida = impagas.some((x) => (x.compra.vencimiento as Date).getTime() < desdeHoy);
-
-  return { totalComprado, totalPagado, saldo: totalComprado - totalPagado, imputadas, pagos, proximoVencimiento, vencida };
+  const porProveedor = new Map<string, Vencimientos>();
+  for (const c of impagas.values()) {
+    if (!c.vencimiento) continue;
+    const v = porProveedor.get(c.proveedorId) ?? { proximoVencimiento: null, vencida: false };
+    if (c.vencimiento.getTime() < desdeHoy) v.vencida = true;
+    else if (!v.proximoVencimiento || c.vencimiento.getTime() < v.proximoVencimiento.getTime()) v.proximoVencimiento = c.vencimiento;
+    porProveedor.set(c.proveedorId, v);
+  }
+  return porProveedor;
 }
-
-const masRecientePrimero = (a: { fecha: Date }, b: { fecha: Date }) => b.fecha.getTime() - a.fecha.getTime();
 
 /** Pantalla /proveedores: deuda total, próximo vencimiento, lista y últimas compras. */
 export async function resumenProveedores({ ultimas = 6 }: { ultimas?: number } = {}) {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = ahora();
 
-  const cuentas = s.proveedores.map((p) => ({ p, cuenta: cuentaDe(s, p.id, hoy) }));
+  const [lista, comprado, pagado, recientes] = await Promise.all([
+    prisma.proveedor.findMany({ select: { id: true, nombre: true, rubro: true } }),
+    prisma.compra.groupBy({ by: ["proveedorId"], _sum: { total: true } }),
+    prisma.pagoProveedor.groupBy({ by: ["proveedorId"], _sum: { monto: true } }),
+    prisma.compra.findMany({
+      orderBy: ordenCompras,
+      take: ultimas,
+      select: {
+        id: true,
+        fecha: true,
+        proveedorId: true,
+        numeroFactura: true,
+        vencimiento: true,
+        total: true,
+        proveedor: { select: { nombre: true } },
+        _count: { select: { items: true } },
+      },
+    }),
+  ]);
 
-  const proveedores: ProveedorFila[] = cuentas
-    .map(({ p, cuenta }) => ({
-      id: p.id,
-      nombre: p.nombre,
-      rubro: p.rubro,
-      saldo: cuenta.saldo,
-      proximoVencimiento: cuenta.saldo > 0 ? cuenta.proximoVencimiento : null,
-      vencida: cuenta.saldo > 0 && cuenta.vencida,
-    }))
+  const saldos = new Map<string, number>();
+  for (const c of comprado) saldos.set(c.proveedorId, c._sum.total ?? 0);
+  for (const p of pagado) saldos.set(p.proveedorId, (saldos.get(p.proveedorId) ?? 0) - (p._sum.monto ?? 0));
+
+  const impagas = await comprasImpagas(prisma, saldos);
+  const vencimientos = vencimientosPorProveedor(impagas, hoy);
+
+  const proveedores: ProveedorFila[] = lista
+    .map((p) => {
+      const saldo = saldos.get(p.id) ?? 0;
+      const v = vencimientos.get(p.id);
+      return {
+        id: p.id,
+        nombre: p.nombre,
+        rubro: p.rubro,
+        saldo,
+        proximoVencimiento: saldo > 0 ? (v?.proximoVencimiento ?? null) : null,
+        vencida: saldo > 0 && Boolean(v?.vencida),
+      };
+    })
     // Primero a quienes les debés (vencidas y lo que vence antes), después el resto por nombre.
     .sort((a, b) => {
       const da = a.saldo > 0 ? 0 : 1;
@@ -125,23 +189,17 @@ export async function resumenProveedores({ ultimas = 6 }: { ultimas?: number } =
     ? { fecha: conVencimiento[0].proximoVencimiento as Date, proveedorId: conVencimiento[0].id, proveedorNombre: conVencimiento[0].nombre }
     : null;
 
-  const pendientePorCompra = new Map<string, number>();
-  for (const { cuenta } of cuentas) for (const x of cuenta.imputadas) pendientePorCompra.set(x.compra.id, x.pendiente);
-
-  const ultimasCompras: CompraFila[] = [...s.compras]
-    .sort(masRecientePrimero)
-    .slice(0, ultimas)
-    .map((c) => ({
-      id: c.id,
-      fecha: c.fecha,
-      proveedorId: c.proveedorId,
-      proveedorNombre: s.proveedores.find((p) => p.id === c.proveedorId)?.nombre ?? "Proveedor",
-      numeroFactura: c.numeroFactura,
-      vencimiento: c.vencimiento,
-      total: c.total,
-      cantidadItems: s.itemsCompra.filter((i) => i.compraId === c.id).length,
-      pendiente: pendientePorCompra.get(c.id) ?? c.total,
-    }));
+  const ultimasCompras: CompraFila[] = recientes.map((c) => ({
+    id: c.id,
+    fecha: c.fecha,
+    proveedorId: c.proveedorId,
+    proveedorNombre: c.proveedor.nombre,
+    numeroFactura: c.numeroFactura,
+    vencimiento: c.vencimiento,
+    total: c.total,
+    cantidadItems: c._count.items,
+    pendiente: impagas.get(c.id)?.pendiente ?? 0,
+  }));
 
   return {
     totalDeuda,
@@ -177,60 +235,103 @@ export type PagoFila = { id: string; fecha: Date; monto: number; medio: MedioPag
 
 export type InsumoDeProveedor = { id: string; nombre: string; stock: number; unidad: Unidad; estado: EstadoStock };
 
-/** Ficha de un proveedor con su cuenta. `null` si no existe. */
+const selectDatosProveedor = {
+  id: true,
+  nombre: true,
+  rubro: true,
+  contacto: true,
+  telefono: true,
+  email: true,
+  cuit: true,
+  direccion: true,
+  notas: true,
+} satisfies Prisma.ProveedorSelect;
+
+/**
+ * Ficha de un proveedor con su cuenta. `null` si no existe.
+ * Los totales y el saldo son de todo el historial; las listas traen las últimas compras y pagos.
+ */
 export async function obtenerProveedor(id: string) {
-  const s = await leerStore();
-  const p = s.proveedores.find((x) => x.id === id);
+  const prisma = await leerDb();
+  const [p, comprado, pagado, ultimasCompras, ultimosPagos, insumosQueProvee] = await Promise.all([
+    prisma.proveedor.findUnique({ where: { id }, select: selectDatosProveedor }),
+    prisma.compra.aggregate({ where: { proveedorId: id }, _sum: { total: true } }),
+    prisma.pagoProveedor.aggregate({ where: { proveedorId: id }, _sum: { monto: true } }),
+    prisma.compra.findMany({
+      where: { proveedorId: id },
+      orderBy: ordenCompras,
+      take: COMPRAS_FICHA,
+      select: {
+        id: true,
+        fecha: true,
+        numeroFactura: true,
+        vencimiento: true,
+        total: true,
+        notas: true,
+        items: {
+          orderBy: { id: "asc" },
+          select: {
+            id: true,
+            descripcion: true,
+            cantidad: true,
+            precioUnitario: true,
+            insumoId: true,
+            insumo: { select: { unidad: true } },
+          },
+        },
+      },
+    }),
+    prisma.pagoProveedor.findMany({
+      where: { proveedorId: id },
+      orderBy: [{ fecha: "desc" }, { createdAt: "desc" }, { id: "desc" }],
+      take: PAGOS_FICHA,
+      select: { id: true, fecha: true, monto: true, medio: true, notas: true },
+    }),
+    prisma.insumo.findMany({
+      where: { proveedorId: id, activo: true },
+      select: { id: true, nombre: true, stock: true, stockMinimo: true, unidad: true },
+    }),
+  ]);
   if (!p) return null;
+
   const hoy = ahora();
-  const cuenta = cuentaDe(s, p.id, hoy);
+  const totalComprado = comprado._sum.total ?? 0;
+  const totalPagado = pagado._sum.monto ?? 0;
+  const saldo = totalComprado - totalPagado;
+  const impagas = await comprasImpagas(prisma, new Map([[id, saldo]]));
+  const vencimientos = vencimientosPorProveedor(impagas, hoy).get(id);
 
-  const compras: CompraDetalle[] = cuenta.imputadas
-    .map(({ compra, pendiente }) => ({
-      id: compra.id,
-      fecha: compra.fecha,
-      numeroFactura: compra.numeroFactura,
-      vencimiento: compra.vencimiento,
-      total: compra.total,
-      pendiente,
-      notas: compra.notas,
-      items: s.itemsCompra
-        .filter((i) => i.compraId === compra.id)
-        .map((i) => ({
-          id: i.id,
-          descripcion: i.descripcion,
-          cantidad: i.cantidad,
-          precioUnitario: i.precioUnitario,
-          insumoId: i.insumoId,
-          unidad: i.insumoId ? (s.insumos.find((x) => x.id === i.insumoId)?.unidad ?? null) : null,
-        })),
-    }))
-    .sort(masRecientePrimero);
+  const compras: CompraDetalle[] = ultimasCompras.map((c) => ({
+    id: c.id,
+    fecha: c.fecha,
+    numeroFactura: c.numeroFactura,
+    vencimiento: c.vencimiento,
+    total: c.total,
+    pendiente: impagas.get(c.id)?.pendiente ?? 0,
+    notas: c.notas,
+    items: c.items.map((i) => ({
+      id: i.id,
+      descripcion: i.descripcion,
+      cantidad: i.cantidad,
+      precioUnitario: i.precioUnitario,
+      insumoId: i.insumoId,
+      unidad: i.insumo?.unidad ?? null,
+    })),
+  }));
 
-  const pagos: PagoFila[] = [...cuenta.pagos]
-    .sort(masRecientePrimero)
-    .map((x) => ({ id: x.id, fecha: x.fecha, monto: x.monto, medio: x.medio, notas: x.notas }));
+  const pagos: PagoFila[] = ultimosPagos;
 
-  const insumos: InsumoDeProveedor[] = s.insumos
-    .filter((i) => i.activo && i.proveedorId === p.id)
+  const insumos: InsumoDeProveedor[] = insumosQueProvee
     .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"))
     .map((i) => ({ id: i.id, nombre: i.nombre, stock: i.stock, unidad: i.unidad, estado: estadoStock(i) }));
 
   return {
-    id: p.id,
-    nombre: p.nombre,
-    rubro: p.rubro,
-    contacto: p.contacto,
-    telefono: p.telefono,
-    email: p.email,
-    cuit: p.cuit,
-    direccion: p.direccion,
-    notas: p.notas,
-    saldo: cuenta.saldo,
-    totalComprado: cuenta.totalComprado,
-    totalPagado: cuenta.totalPagado,
-    proximoVencimiento: cuenta.saldo > 0 ? cuenta.proximoVencimiento : null,
-    vencida: cuenta.saldo > 0 && cuenta.vencida,
+    ...p,
+    saldo,
+    totalComprado,
+    totalPagado,
+    proximoVencimiento: saldo > 0 ? (vencimientos?.proximoVencimiento ?? null) : null,
+    vencida: saldo > 0 && Boolean(vencimientos?.vencida),
     compras,
     pagos,
     insumos,
@@ -242,28 +343,15 @@ export type ProveedorDetalle = NonNullable<Awaited<ReturnType<typeof obtenerProv
 
 /** Datos de contacto de un proveedor, para editarlo o cargarle una compra. `null` si no existe. */
 export async function datosProveedor(id: string) {
-  const s = await leerStore();
-  const p = s.proveedores.find((x) => x.id === id);
-  if (!p) return null;
-  return {
-    id: p.id,
-    nombre: p.nombre,
-    rubro: p.rubro,
-    contacto: p.contacto,
-    telefono: p.telefono,
-    email: p.email,
-    cuit: p.cuit,
-    direccion: p.direccion,
-    notas: p.notas,
-  };
+  const prisma = await leerDb();
+  return prisma.proveedor.findUnique({ where: { id }, select: selectDatosProveedor });
 }
 
 export type DatosProveedor = NonNullable<Awaited<ReturnType<typeof datosProveedor>>>;
 
 /** Proveedores para elegir en un <select> o en una lista. */
 export async function opcionesProveedores(): Promise<{ id: string; nombre: string; rubro: string | null }[]> {
-  const s = await leerStore();
-  return [...s.proveedores]
-    .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"))
-    .map((p) => ({ id: p.id, nombre: p.nombre, rubro: p.rubro }));
+  const prisma = await leerDb();
+  const proveedores = await prisma.proveedor.findMany({ select: { id: true, nombre: true, rubro: true } });
+  return proveedores.sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
 }

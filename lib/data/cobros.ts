@@ -1,9 +1,17 @@
 import "server-only";
-import type { EstadoTrabajo, MedioPago } from "@/lib/generated/prisma/client";
-import { ahora, leerStore, type Store } from "@/lib/mock/store";
-import { saldo } from "@/lib/calculos";
+import type { EstadoTrabajo, MedioPago, Prisma } from "@/lib/generated/prisma/client";
+import { ahora, leerDb } from "@/lib/db";
+import { saldo, totalItems } from "@/lib/calculos";
 import { finMes, inicioDia, inicioMes, mismoDia } from "@/lib/fechas";
-import { cuentaComoDeuda, cuentasPorCliente, totalesPorTrabajo } from "./clientes";
+import {
+  ESTADOS_CON_DEUDA,
+  SELECT_ITEM,
+  agrupar,
+  calcularCuenta,
+  cobradoAgrupado,
+  cuentaComoDeuda,
+  totalPorTrabajo,
+} from "./clientes";
 
 // ───────── Formulario "Registrar cobro" ─────────
 
@@ -37,33 +45,69 @@ export type DatosNuevoCobro = {
  * `trabajoId` fuerza a incluir ese trabajo (si no está cancelado) aunque no tenga saldo.
  */
 export async function datosNuevoCobro(trabajoId?: string): Promise<DatosNuevoCobro> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = ahora();
-  const cuentas = cuentasPorCliente(s);
-  const totales = totalesPorTrabajo(s);
 
-  const clientes = s.clientes
-    .map((c) => ({
-      id: c.id,
-      nombre: c.nombre,
-      falta: cuentas.get(c.id)?.falta ?? 0,
-      trabajos: s.trabajos
-        .filter((t) => t.clienteId === c.id && t.estado !== "CANCELADO")
-        .map((t) => {
-          const { total, pagado } = totales.get(t.id) ?? { total: 0, pagado: 0 };
-          return { id: t.id, numero: t.numero, titulo: t.titulo, estado: t.estado, total, pagado, falta: saldo(total, pagado) };
-        })
-        .filter((t) => t.id === trabajoId || (cuentaComoDeuda(t.estado) && t.falta > 0))
-        .sort((a, b) => a.numero - b.numero),
-    }))
+  // Se traen los trabajos que suman deuda (para el saldo de cada cliente) y,
+  // si vino ?trabajo=, también ese (aunque sea un presupuesto). Ítems en paralelo.
+  const filtro: Prisma.TrabajoWhereInput = {
+    OR: [
+      { estado: { in: [...ESTADOS_CON_DEUDA] } },
+      ...(trabajoId ? [{ id: trabajoId, estado: { not: "CANCELADO" as const } }] : []),
+    ],
+  };
+  const [clientesDb, trabajosDb, itemsDb, cobrado] = await Promise.all([
+    prisma.cliente.findMany({ select: { id: true, nombre: true } }),
+    prisma.trabajo.findMany({
+      where: filtro,
+      select: { id: true, clienteId: true, numero: true, titulo: true, estado: true },
+      orderBy: { numero: "asc" },
+    }),
+    prisma.itemTrabajo.findMany({ where: { trabajo: { is: filtro } }, select: SELECT_ITEM }),
+    cobradoAgrupado(prisma),
+  ]);
+  const totales = totalPorTrabajo(itemsDb);
+
+  const trabajosPorCliente = agrupar(
+    trabajosDb.map((t) => {
+      const total = totales.get(t.id) ?? 0;
+      const pagado = cobrado.porTrabajo.get(t.id) ?? 0;
+      return {
+        clienteId: t.clienteId,
+        trabajo: { id: t.id, numero: t.numero, titulo: t.titulo, estado: t.estado, total, pagado, falta: saldo(total, pagado) },
+      };
+    }),
+    (t) => t.clienteId,
+  );
+
+  const clientes = clientesDb
+    .map((c) => {
+      const trabajos = (trabajosPorCliente.get(c.id) ?? []).map((t) => t.trabajo);
+      return {
+        id: c.id,
+        nombre: c.nombre,
+        falta: calcularCuenta(trabajos, cobrado.porCliente.get(c.id) ?? 0).falta,
+        trabajos: trabajos.filter((t) => t.id === trabajoId || (cuentaComoDeuda(t.estado) && t.falta > 0)),
+      };
+    })
     .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
 
   return { clientes, hoy };
 }
 
-/** Total y cobrado de un trabajo (para validar y cerrar el trabajo en la server action). */
-export function saldoDeTrabajo(s: Store, trabajoId: string): { total: number; pagado: number; falta: number } {
-  const { total, pagado } = totalesPorTrabajo(s).get(trabajoId) ?? { total: 0, pagado: 0 };
+/**
+ * Total y cobrado de un trabajo, leídos con el cliente de la transacción
+ * (para validar el monto y cerrar el trabajo en la server action).
+ */
+export async function saldoDeTrabajo(
+  tx: Prisma.TransactionClient,
+  trabajoId: string,
+): Promise<{ total: number; pagado: number; falta: number }> {
+  // En secuencia: dentro de una transacción comparten una sola conexión.
+  const items = await tx.itemTrabajo.findMany({ where: { trabajoId }, select: { cantidad: true, precioUnitario: true } });
+  const cobrado = await tx.cobro.aggregate({ where: { trabajoId }, _sum: { monto: true } });
+  const total = totalItems(items);
+  const pagado = cobrado._sum.monto ?? 0;
   return { total, pagado, falta: saldo(total, pagado) };
 }
 
@@ -91,29 +135,24 @@ export type CobrosDelMes = {
 };
 
 export async function cobrosDelMes(): Promise<CobrosDelMes> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = ahora();
-  const desde = inicioMes(hoy).getTime();
-  const hasta = finMes(hoy).getTime();
 
-  const clientes = new Map(s.clientes.map((c) => [c.id, c]));
-  const trabajos = new Map(s.trabajos.map((t) => [t.id, t]));
-
-  const cobros: CobroDelMes[] = s.cobros
-    .filter((c) => c.fecha.getTime() >= desde && c.fecha.getTime() <= hasta)
-    .sort((a, b) => b.fecha.getTime() - a.fecha.getTime() || b.createdAt.getTime() - a.createdAt.getTime())
-    .map((c) => {
-      const t = c.trabajoId ? trabajos.get(c.trabajoId) : undefined;
-      return {
-        id: c.id,
-        fecha: c.fecha,
-        monto: c.monto,
-        medio: c.medio,
-        concepto: c.concepto,
-        cliente: { id: c.clienteId, nombre: clientes.get(c.clienteId)?.nombre ?? "Cliente borrado" },
-        trabajo: t ? { numero: t.numero, titulo: t.titulo } : null,
-      };
-    });
+  // Solo los cobros del mes (en hora de Argentina). Se muestran todos, así que
+  // los totales por día y por medio se suman sobre estas mismas filas.
+  const cobros: CobroDelMes[] = await prisma.cobro.findMany({
+    where: { fecha: { gte: inicioMes(hoy), lte: finMes(hoy) } },
+    orderBy: [{ fecha: "desc" }, { createdAt: "desc" }],
+    select: {
+      id: true,
+      fecha: true,
+      monto: true,
+      medio: true,
+      concepto: true,
+      cliente: { select: { id: true, nombre: true } },
+      trabajo: { select: { numero: true, titulo: true } },
+    },
+  });
 
   const dias: CobrosDelMes["dias"] = [];
   for (const c of cobros) {

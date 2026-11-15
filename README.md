@@ -13,14 +13,19 @@ proveedores y compras, gastos y personal, reportes mensuales.
 - Prisma 7 + Neon (Postgres) — `prisma/schema.prisma`
 - zod para validar formularios
 
-## Estado actual: datos de ejemplo
+## Base de datos (Neon)
 
-Hoy la app corre con datos de ejemplo en memoria (`lib/mock/`), con la misma
-forma que las tablas de Prisma. Todas las lecturas pasan por `lib/data/*.ts` y
-todas las escrituras por los `actions.ts` de cada sección, así que conectar la
-base es reemplazar esas funciones por consultas con `getPrisma()` (`lib/db.ts`).
+El proyecto de Neon `bajo_cero` tiene dos ramas:
 
-Los cambios que se hagan en la app se pierden al reiniciar el servidor.
+| Rama | Para qué | Datos |
+|---|---|---|
+| `main` | Producción (Vercel) | Reales. Arranca vacía. |
+| `desarrollo` | Trabajar en local | De ejemplo (`npm run db:seed`) |
+
+- `.env` local apunta a `desarrollo`. Las variables `PROD_*` guardan la conexión de `main` para cargarlas en Vercel.
+- Lecturas: `lib/data/*.ts` con `leerDb()`. Escrituras: los `actions.ts` de cada sección con `db()` (`lib/db.ts`).
+- Cambios de esquema: editar `prisma/schema.prisma` y crear una migración (`npm run db:migrate`). Nunca `migrate reset` ni `db push` sobre `main`; probar primero en `desarrollo`.
+- Aplicar migraciones pendientes a producción: `DIRECT_URL=<PROD_DIRECT_URL> npx prisma migrate deploy`.
 
 ## Correr en local
 
@@ -31,12 +36,6 @@ npm run dev
 
 Abrí http://localhost:3000. Para probar la instalación como app y el service
 worker, usá `npm run build && npm start`.
-
-## Conectar Neon (próximo paso)
-
-1. Copiá `.env.example` a `.env` y completá `DATABASE_URL` (con `-pooler`) y `DIRECT_URL` (sin `-pooler`).
-2. `npm run db:migrate` crea las tablas.
-3. Pasar `lib/data/*.ts` y los `actions.ts` de `lib/mock` a Prisma.
 
 ## Estructura
 

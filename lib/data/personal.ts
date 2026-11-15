@@ -1,10 +1,10 @@
 import "server-only";
-import { ahora, leerStore, type Store } from "@/lib/mock/store";
+import { ahora, leerDb } from "@/lib/db";
 import { aInputFecha } from "@/lib/fechas";
 import { sumaMontos } from "@/lib/calculos";
 import { MEDIO_PAGO } from "@/lib/etiquetas";
 import type { Empleado } from "@/lib/generated/prisma/client";
-import { delPeriodo, resolverMes, type MesInfo } from "./reportes";
+import { enRango, resolverMes, type MesInfo } from "./reportes";
 import { trabajosActivos, type OpcionTrabajo } from "./gastos";
 
 export type ResumenEmpleado = {
@@ -24,19 +24,18 @@ export type ResumenEmpleado = {
   saldo: number;
 };
 
-function resumen(s: Store, e: Empleado, desde: Date, hasta: Date): ResumenEmpleado {
-  const jornadas = delPeriodo(
-    s.jornadas.filter((j) => j.empleadoId === e.id),
-    desde,
-    hasta,
-  );
-  const pagos = delPeriodo(
-    s.gastos.filter((g) => g.categoria === "PERSONAL" && g.empleadoId === e.id),
-    desde,
-    hasta,
-  );
-  const devengado = sumaMontos(jornadas);
-  const pagado = sumaMontos(pagos);
+type DatosEmpleado = Pick<Empleado, "id" | "nombre" | "puesto" | "telefono" | "jornal" | "activo">;
+
+const camposEmpleado = {
+  id: true,
+  nombre: true,
+  puesto: true,
+  telefono: true,
+  jornal: true,
+  activo: true,
+} as const;
+
+function resumen(e: DatosEmpleado, jornadas: number, devengado: number, pagado: number): ResumenEmpleado {
   return {
     id: e.id,
     nombre: e.nombre,
@@ -44,7 +43,7 @@ function resumen(s: Store, e: Empleado, desde: Date, hasta: Date): ResumenEmplea
     telefono: e.telefono,
     jornal: e.jornal,
     activo: e.activo,
-    jornadas: jornadas.length,
+    jornadas,
     devengado,
     pagado,
     saldo: devengado - pagado,
@@ -60,10 +59,34 @@ export type PersonalDelMes = {
 };
 
 export async function personalDelMes(clave: string | undefined): Promise<PersonalDelMes> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const { info, desde, hasta } = resolverMes(clave, ahora());
-  const todos = s.empleados
-    .map((e) => resumen(s, e, desde, hasta))
+  const delMes = enRango(desde, hasta);
+
+  // Empleados: tabla chica, entera. Jornadas y pagos del mes: sumados en la base por persona.
+  const [lista, jornadas, pagos] = await Promise.all([
+    prisma.empleado.findMany({ select: camposEmpleado }),
+    prisma.jornada.groupBy({
+      by: ["empleadoId"],
+      where: { fecha: delMes },
+      _sum: { monto: true },
+      _count: { _all: true },
+    }),
+    prisma.gasto.groupBy({
+      by: ["empleadoId"],
+      where: { fecha: delMes, categoria: "PERSONAL", empleadoId: { not: null } },
+      _sum: { monto: true },
+    }),
+  ]);
+
+  const jornadasDe = new Map(jornadas.map((j) => [j.empleadoId, { dias: j._count._all, monto: j._sum.monto ?? 0 }]));
+  const pagadoA = new Map(pagos.map((p) => [p.empleadoId, p._sum.monto ?? 0]));
+
+  const todos = lista
+    .map((e) => {
+      const j = jornadasDe.get(e.id);
+      return resumen(e, j?.dias ?? 0, j?.monto ?? 0, pagadoA.get(e.id) ?? 0);
+    })
     .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
   const empleados = todos.filter((e) => e.activo);
   const inactivos = todos.filter((e) => !e.activo);
@@ -102,44 +125,47 @@ export type EmpleadoDelMes = {
 };
 
 export async function empleadoDelMes(id: string, clave: string | undefined): Promise<EmpleadoDelMes | null> {
-  const s = await leerStore();
-  const e = s.empleados.find((x) => x.id === id);
-  if (!e) return null;
+  const prisma = await leerDb();
   const hoy = ahora();
   const { info, desde, hasta } = resolverMes(clave, hoy);
+  const delMes = enRango(desde, hasta);
 
-  const jornadas = delPeriodo(
-    s.jornadas.filter((j) => j.empleadoId === id),
-    desde,
-    hasta,
-  )
-    .sort((a, b) => b.fecha.getTime() - a.fecha.getTime())
-    .map((j) => {
-      const t = j.trabajoId ? s.trabajos.find((x) => x.id === j.trabajoId) : undefined;
-      return {
-        id: j.id,
-        fecha: j.fecha,
-        horas: j.horas,
-        monto: j.monto,
-        notas: j.notas,
-        trabajo: t ? { id: t.id, numero: t.numero, titulo: t.titulo } : null,
-      };
-    });
-
-  const pagos = delPeriodo(
-    s.gastos.filter((g) => g.categoria === "PERSONAL" && g.empleadoId === id),
-    desde,
-    hasta,
-  )
-    .sort((a, b) => b.fecha.getTime() - a.fecha.getTime())
-    .map((g) => ({ id: g.id, fecha: g.fecha, descripcion: g.descripcion, medioLabel: MEDIO_PAGO[g.medio], monto: g.monto }));
+  // Todo en paralelo: si la persona no existe se descarta lo demás (caso raro).
+  const [e, jornadas, pagos, trabajos] = await Promise.all([
+    prisma.empleado.findUnique({ where: { id }, select: camposEmpleado }),
+    prisma.jornada.findMany({
+      where: { empleadoId: id, fecha: delMes },
+      orderBy: [{ fecha: "desc" }, { id: "asc" }],
+      select: {
+        id: true,
+        fecha: true,
+        horas: true,
+        monto: true,
+        notas: true,
+        trabajo: { select: { id: true, numero: true, titulo: true } },
+      },
+    }),
+    prisma.gasto.findMany({
+      where: { empleadoId: id, categoria: "PERSONAL", fecha: delMes },
+      orderBy: [{ fecha: "desc" }, { createdAt: "desc" }, { id: "asc" }],
+      select: { id: true, fecha: true, descripcion: true, medio: true, monto: true },
+    }),
+    trabajosActivos(prisma),
+  ]);
+  if (!e) return null;
 
   return {
     mes: info,
-    empleado: resumen(s, e, desde, hasta),
+    empleado: resumen(e, jornadas.length, sumaMontos(jornadas), sumaMontos(pagos)),
     jornadas,
-    pagos,
-    trabajos: trabajosActivos(s),
+    pagos: pagos.map((g) => ({
+      id: g.id,
+      fecha: g.fecha,
+      descripcion: g.descripcion,
+      medioLabel: MEDIO_PAGO[g.medio],
+      monto: g.monto,
+    })),
+    trabajos,
     hoy: aInputFecha(hoy),
   };
 }
@@ -154,8 +180,6 @@ export type EmpleadoEditable = {
 };
 
 export async function empleadoParaEditar(id: string): Promise<EmpleadoEditable | null> {
-  const s = await leerStore();
-  const e = s.empleados.find((x) => x.id === id);
-  if (!e) return null;
-  return { id: e.id, nombre: e.nombre, puesto: e.puesto, telefono: e.telefono, jornal: e.jornal, activo: e.activo };
+  const prisma = await leerDb();
+  return prisma.empleado.findUnique({ where: { id }, select: camposEmpleado });
 }

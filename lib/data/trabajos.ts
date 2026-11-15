@@ -1,6 +1,8 @@
 import "server-only";
+import { Prisma, type Empresa, type PrismaClient } from "@/lib/generated/prisma/client";
 import type { EstadoTrabajo, EstadoTurno, MedioPago, TipoCliente, TipoTrabajo, Unidad } from "@/lib/generated/prisma/enums";
-import { leerStore, ahora, type Store } from "@/lib/mock/store";
+import { leerDb, ahora } from "@/lib/db";
+import { EMPRESA_DEFECTO } from "@/lib/empresa-defecto";
 import { costoConsumos, rentabilidad, saldo, sumaMontos, totalItems, type Rentabilidad } from "@/lib/calculos";
 import { aInputFecha, sumarDias } from "@/lib/fechas";
 
@@ -164,74 +166,98 @@ export type TrabajoParaEditar = {
 
 // ───────── Ayudas internas ─────────
 
-function agrupar<T>(filas: T[], clave: (f: T) => string | null): Map<string, T[]> {
-  const m = new Map<string, T[]>();
-  for (const f of filas) {
-    const k = clave(f);
-    if (k === null) continue;
-    const lista = m.get(k);
-    if (lista) lista.push(f);
-    else m.set(k, [f]);
-  }
-  return m;
-}
+// La base ordena con collation "C" (Á después de Z): las listas chicas que se
+// cargan enteras se ordenan acá, como en castellano.
+const COLLATOR_ES = new Intl.Collator("es");
+const porNombre = (a: { nombre: string }, b: { nombre: string }) => COLLATOR_ES.compare(a.nombre, b.nombre);
 
 /** Minúsculas y sin acentos, para buscar. */
 function normalizar(texto: string): string {
   return texto.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
 }
 
-function itemsDe(s: Store, trabajoId: string): ItemDeTrabajo[] {
-  return s.items
-    .filter((i) => i.trabajoId === trabajoId)
-    .sort((a, b) => a.orden - b.orden)
-    .map((i) => ({
-      id: i.id,
-      descripcion: i.descripcion,
-      cantidad: i.cantidad,
-      unidad: i.unidad,
-      precioUnitario: i.precioUnitario,
-      importe: Math.round(i.cantidad * i.precioUnitario),
-      insumoId: i.insumoId,
-    }));
+// Para buscar sin acentos en SQL sin depender de la extensión "unaccent".
+const CON_ACENTO = "ÁÀÂÄÃÅÉÈÊËÍÌÎÏÓÒÔÖÕÚÙÛÜÑÇÝáàâäãåéèêëíìîïóòôöõúùûüñçýÿ";
+const SIN_ACENTO = "AAAAAAEEEEIIIIOOOOOUUUUNCYaaaaaaeeeeiiiiooooouuuuncyy";
+
+const SELECT_ITEM = {
+  id: true,
+  descripcion: true,
+  cantidad: true,
+  unidad: true,
+  precioUnitario: true,
+  insumoId: true,
+} satisfies Prisma.ItemTrabajoSelect;
+
+function aItem(i: Prisma.ItemTrabajoGetPayload<{ select: typeof SELECT_ITEM }>): ItemDeTrabajo {
+  return { ...i, importe: Math.round(i.cantidad * i.precioUnitario) };
 }
 
-function visitasDe(s: Store, trabajoId: string): VisitaDeTrabajo[] {
-  const nombres = new Map(s.empleados.map((e) => [e.id, e.nombre]));
-  return s.turnos
-    .filter((t) => t.trabajoId === trabajoId)
-    .sort((a, b) => a.inicio.getTime() - b.inicio.getTime())
-    .map((t) => ({
-      id: t.id,
-      inicio: t.inicio,
-      fin: t.fin,
-      estado: t.estado,
-      notas: t.notas,
-      tecnicos: s.turnoTecnicos
-        .filter((tt) => tt.turnoId === t.id)
-        .map((tt) => nombres.get(tt.empleadoId))
-        .filter((n): n is string => Boolean(n)),
-    }));
+const SELECT_INSUMO_PARA_ITEMS = {
+  id: true,
+  nombre: true,
+  categoria: true,
+  unidad: true,
+  precioVenta: true,
+  stock: true,
+} satisfies Prisma.InsumoSelect;
+
+async function insumosParaItems(prisma: PrismaClient): Promise<InsumoParaItems[]> {
+  const insumos = await prisma.insumo.findMany({ where: { activo: true }, select: SELECT_INSUMO_PARA_ITEMS });
+  return insumos.sort(porNombre);
 }
 
-function insumosParaItems(s: Store): InsumoParaItems[] {
-  return s.insumos
-    .filter((i) => i.activo)
-    .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"))
-    .map((i) => ({
-      id: i.id,
-      nombre: i.nombre,
-      categoria: i.categoria,
-      unidad: i.unidad,
-      precioVenta: i.precioVenta,
-      stock: i.stock,
-    }));
+/** La fila de la empresa o, si todavía no se cargó en Ajustes, los valores por defecto. */
+async function empresaODefecto(prisma: PrismaClient): Promise<Empresa> {
+  return (await prisma.empresa.findUnique({ where: { id: EMPRESA_DEFECTO.id } })) ?? EMPRESA_DEFECTO;
 }
 
-function clientesParaTrabajo(s: Store): ClienteParaTrabajo[] {
-  return [...s.clientes]
-    .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"))
-    .map((c) => ({ id: c.id, nombre: c.nombre, direccion: c.direccion }));
+function whereDeFiltro(filtro: FiltroTrabajos): Prisma.TrabajoWhereInput {
+  if (filtro === "TODOS") return {};
+  if (filtro === "ACTIVOS") return { estado: { in: [...ESTADOS_ACTIVOS] } };
+  return { estado: filtro };
+}
+
+function entraEnFiltro(filtro: FiltroTrabajos, estado: EstadoTrabajo): boolean {
+  return filtro === "TODOS" ? true : filtro === "ACTIVOS" ? ESTADOS_ACTIVOS.includes(estado) : estado === filtro;
+}
+
+function contarPorEstado(grupos: { estado: EstadoTrabajo; cantidad: number }[]): Record<FiltroTrabajos, number> {
+  const conteos: Record<FiltroTrabajos, number> = {
+    ACTIVOS: 0,
+    TODOS: 0,
+    PRESUPUESTO: 0,
+    APROBADO: 0,
+    EN_CURSO: 0,
+    TERMINADO: 0,
+    COBRADO: 0,
+    CANCELADO: 0,
+  };
+  for (const { estado, cantidad } of grupos) {
+    conteos[estado] += cantidad;
+    conteos.TODOS += cantidad;
+    if (ESTADOS_ACTIVOS.includes(estado)) conteos.ACTIVOS += cantidad;
+  }
+  return conteos;
+}
+
+/**
+ * Trabajos que coinciden con la búsqueda (ya normalizada): nombre del cliente o
+ * título sin importar mayúsculas ni acentos, o número que empieza con lo buscado.
+ * Devuelve todos los estados para poder contar cada filtro.
+ */
+async function buscarTrabajos(prisma: PrismaClient, q: string): Promise<{ id: string; estado: EstadoTrabajo }[]> {
+  const patron = `%${q.replace(/[\\%_]/g, "\\$&")}%`;
+  const numero = q.replace(/^n\.?º?\s*/, "").replace(/^0+/, "");
+  const porNumero = /^\d+$/.test(numero) ? Prisma.sql`OR t.numero::text LIKE ${`${numero}%`}` : Prisma.empty;
+  return prisma.$queryRaw<{ id: string; estado: EstadoTrabajo }[]>`
+    SELECT t.id, t.estado::text AS estado
+    FROM "Trabajo" t
+    JOIN "Cliente" c ON c.id = t."clienteId"
+    WHERE lower(translate(c.nombre, ${CON_ACENTO}, ${SIN_ACENTO})) LIKE ${patron}
+       OR lower(translate(t.titulo, ${CON_ACENTO}, ${SIN_ACENTO})) LIKE ${patron}
+       ${porNumero}
+  `;
 }
 
 // ───────── Consultas ─────────
@@ -241,113 +267,148 @@ export async function listarTrabajos(
   filtro: FiltroTrabajos,
   busqueda: string,
 ): Promise<{ filas: FilaTrabajo[]; conteos: Record<FiltroTrabajos, number>; hoy: Date }> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = ahora();
 
-  const clientes = new Map(s.clientes.map((c) => [c.id, c]));
-  const items = agrupar(s.items, (i) => i.trabajoId);
-  const cobros = agrupar(s.cobros, (c) => c.trabajoId);
-  const turnos = agrupar(
-    s.turnos.filter((t) => TURNOS_PENDIENTES.includes(t.estado) && t.fin.getTime() >= hoy.getTime()),
-    (t) => t.trabajoId,
-  );
-
+  // Con búsqueda, primero los ids que coinciden (y sus estados, para los conteos).
   const q = normalizar(busqueda.trim());
-  const qNumero = q.replace(/^n\.?º?\s*/, "").replace(/^0+/, "");
+  let conteosBusqueda: Record<FiltroTrabajos, number> | null = null;
+  let where = whereDeFiltro(filtro);
+  if (q) {
+    const encontrados = await buscarTrabajos(prisma, q);
+    conteosBusqueda = contarPorEstado(encontrados.map((e) => ({ estado: e.estado, cantidad: 1 })));
+    const ids = encontrados.filter((e) => entraEnFiltro(filtro, e.estado)).map((e) => e.id);
+    if (ids.length === 0) return { filas: [], conteos: conteosBusqueda, hoy };
+    where = { id: { in: ids } };
+  }
 
-  const encontrados: FilaTrabajo[] = [];
-  for (const t of s.trabajos) {
-    const cliente = clientes.get(t.clienteId);
-    const nombre = cliente?.nombre ?? "Cliente borrado";
-    if (q) {
-      const coincide =
-        normalizar(nombre).includes(q) ||
-        normalizar(t.titulo).includes(q) ||
-        (qNumero !== "" && /^\d+$/.test(qNumero) && String(t.numero).startsWith(qNumero));
-      if (!coincide) continue;
-    }
-    const total = totalItems(items.get(t.id) ?? []);
-    const cobrado = sumaMontos(cobros.get(t.id) ?? []);
-    const proxima = (turnos.get(t.id) ?? []).sort((a, b) => a.inicio.getTime() - b.inicio.getTime())[0];
-    encontrados.push({
+  const [porEstado, trabajos, cobros] = await Promise.all([
+    conteosBusqueda ? null : prisma.trabajo.groupBy({ by: ["estado"], _count: { _all: true } }),
+    prisma.trabajo.findMany({
+      where,
+      orderBy: { numero: "desc" },
+      select: {
+        id: true,
+        numero: true,
+        titulo: true,
+        tipo: true,
+        estado: true,
+        validoHasta: true,
+        cliente: { select: { id: true, nombre: true } },
+        items: { select: { cantidad: true, precioUnitario: true } },
+        turnos: {
+          where: { estado: { in: [...TURNOS_PENDIENTES] }, fin: { gte: hoy } },
+          orderBy: { inicio: "asc" },
+          take: 1,
+          select: { inicio: true },
+        },
+      },
+    }),
+    prisma.cobro.groupBy({ by: ["trabajoId"], where: { trabajo: { is: where } }, _sum: { monto: true } }),
+  ]);
+
+  const conteos =
+    conteosBusqueda ?? contarPorEstado((porEstado ?? []).map((g) => ({ estado: g.estado, cantidad: g._count._all })));
+  const cobrado = new Map(cobros.map((c) => [c.trabajoId, c._sum.monto ?? 0]));
+
+  const filas: FilaTrabajo[] = trabajos.map((t) => {
+    const total = totalItems(t.items);
+    const pagado = cobrado.get(t.id) ?? 0;
+    return {
       id: t.id,
       numero: t.numero,
       titulo: t.titulo,
       tipo: t.tipo,
       estado: t.estado,
-      cliente: { id: t.clienteId, nombre },
+      cliente: t.cliente,
       total,
-      cobrado,
-      falta: saldo(total, cobrado),
+      cobrado: pagado,
+      falta: saldo(total, pagado),
       validoHasta: t.validoHasta,
-      proximaVisita: proxima?.inicio ?? null,
-    });
-  }
-
-  const conteos: Record<FiltroTrabajos, number> = {
-    ACTIVOS: 0,
-    TODOS: encontrados.length,
-    PRESUPUESTO: 0,
-    APROBADO: 0,
-    EN_CURSO: 0,
-    TERMINADO: 0,
-    COBRADO: 0,
-    CANCELADO: 0,
-  };
-  for (const f of encontrados) {
-    conteos[f.estado]++;
-    if (ESTADOS_ACTIVOS.includes(f.estado)) conteos.ACTIVOS++;
-  }
-
-  const filas = encontrados
-    .filter((f) =>
-      filtro === "TODOS" ? true : filtro === "ACTIVOS" ? ESTADOS_ACTIVOS.includes(f.estado) : f.estado === filtro,
-    )
-    .sort((a, b) => b.numero - a.numero);
+      proximaVisita: t.turnos[0]?.inicio ?? null,
+    };
+  });
 
   return { filas, conteos, hoy };
 }
 
 /** Todo lo de un trabajo para su pantalla. `null` si no existe. */
 export async function obtenerTrabajo(id: string): Promise<DetalleTrabajo | null> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = ahora();
-  const t = s.trabajos.find((x) => x.id === id);
+
+  const [t, personal, insumos] = await Promise.all([
+    prisma.trabajo.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        numero: true,
+        titulo: true,
+        tipo: true,
+        estado: true,
+        direccion: true,
+        descripcion: true,
+        fechaPresupuesto: true,
+        validoHasta: true,
+        fechaAprobado: true,
+        fechaTerminado: true,
+        cliente: { select: { id: true, nombre: true, telefono: true, direccion: true } },
+        items: { orderBy: { orden: "asc" }, select: SELECT_ITEM },
+        cobros: {
+          orderBy: [{ fecha: "asc" }, { createdAt: "asc" }],
+          select: { id: true, fecha: true, monto: true, medio: true, concepto: true },
+        },
+        turnos: {
+          orderBy: { inicio: "asc" },
+          select: {
+            id: true,
+            inicio: true,
+            fin: true,
+            estado: true,
+            notas: true,
+            tecnicos: { orderBy: { nombre: "asc" }, select: { nombre: true } },
+          },
+        },
+        checklist: { orderBy: { orden: "asc" }, select: { id: true, texto: true, hecho: true } },
+        movimientos: {
+          where: { tipo: "CONSUMO" },
+          orderBy: { fecha: "asc" },
+          select: {
+            id: true,
+            fecha: true,
+            cantidad: true,
+            costoUnitario: true,
+            insumo: { select: { nombre: true, unidad: true } },
+          },
+        },
+      },
+    }),
+    prisma.jornada.aggregate({ where: { trabajoId: id }, _sum: { monto: true }, _count: true }),
+    prisma.insumo.findMany({ where: { activo: true }, select: { id: true, nombre: true, unidad: true, stock: true } }),
+  ]);
   if (!t) return null;
-  const cliente = s.clientes.find((c) => c.id === t.clienteId);
 
-  const items = itemsDe(s, t.id);
+  const items = t.items.map(aItem);
   const total = totalItems(items);
-  const cobros = s.cobros
-    .filter((c) => c.trabajoId === t.id)
-    .sort((a, b) => a.fecha.getTime() - b.fecha.getTime())
-    .map((c) => ({ id: c.id, fecha: c.fecha, monto: c.monto, medio: c.medio, concepto: c.concepto }));
-  const cobrado = sumaMontos(cobros);
+  const cobrado = sumaMontos(t.cobros);
 
-  const visitas = visitasDe(s, t.id);
+  const visitas: VisitaDeTrabajo[] = t.turnos.map((v) => ({ ...v, tecnicos: v.tecnicos.map((e) => e.nombre) }));
   const proximaVisita =
     visitas.find((v) => TURNOS_PENDIENTES.includes(v.estado) && v.fin.getTime() >= hoy.getTime()) ?? null;
 
-  const insumos = new Map(s.insumos.map((i) => [i.id, i]));
-  const consumos = s.movimientos
-    .filter((m) => m.trabajoId === t.id && m.tipo === "CONSUMO")
-    .sort((a, b) => a.fecha.getTime() - b.fecha.getTime());
-  const materiales: MaterialUsado[] = consumos.map((m) => {
-    const insumo = insumos.get(m.insumoId);
+  const materiales: MaterialUsado[] = t.movimientos.map((m) => {
     const cantidad = Math.abs(m.cantidad);
     const costoUnitario = m.costoUnitario ?? 0;
     return {
       id: m.id,
       fecha: m.fecha,
-      insumo: insumo?.nombre ?? "Insumo borrado",
-      unidad: insumo?.unidad ?? "UNIDAD",
+      insumo: m.insumo.nombre,
+      unidad: m.insumo.unidad,
       cantidad,
       costoUnitario,
       costo: Math.round(cantidad * costoUnitario),
     };
   });
-
-  const jornadas = s.jornadas.filter((j) => j.trabajoId === t.id);
 
   return {
     id: t.id,
@@ -355,48 +416,54 @@ export async function obtenerTrabajo(id: string): Promise<DetalleTrabajo | null>
     titulo: t.titulo,
     tipo: t.tipo,
     estado: t.estado,
-    direccion: t.direccion ?? cliente?.direccion ?? null,
+    direccion: t.direccion ?? t.cliente.direccion,
     descripcion: t.descripcion,
     fechaPresupuesto: t.fechaPresupuesto,
     validoHasta: t.validoHasta,
     fechaAprobado: t.fechaAprobado,
     fechaTerminado: t.fechaTerminado,
-    cliente: {
-      id: t.clienteId,
-      nombre: cliente?.nombre ?? "Cliente borrado",
-      telefono: cliente?.telefono ?? null,
-      direccion: cliente?.direccion ?? null,
-    },
+    cliente: t.cliente,
     items,
     total,
     cobrado,
     falta: saldo(total, cobrado),
-    cobros,
+    cobros: t.cobros,
     visitas,
     proximaVisita,
-    checklist: s.checklist
-      .filter((c) => c.trabajoId === t.id)
-      .sort((a, b) => a.orden - b.orden)
-      .map((c) => ({ id: c.id, texto: c.texto, hecho: c.hecho })),
+    checklist: t.checklist,
     materiales,
-    jornadas: jornadas.length,
-    rentabilidad: rentabilidad(total, costoConsumos(consumos), sumaMontos(jornadas)),
-    insumos: s.insumos
-      .filter((i) => i.activo)
-      .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"))
-      .map((i) => ({ id: i.id, nombre: i.nombre, unidad: i.unidad, stock: i.stock })),
+    jornadas: personal._count,
+    rentabilidad: rentabilidad(total, costoConsumos(t.movimientos), personal._sum.monto ?? 0),
+    insumos: insumos.sort(porNombre),
     hoy,
   };
 }
 
 /** Lo que va en el presupuesto que recibe el cliente. `null` si no existe. */
 export async function obtenerPresupuesto(id: string): Promise<Presupuesto | null> {
-  const s = await leerStore();
-  const t = s.trabajos.find((x) => x.id === id);
+  const prisma = await leerDb();
+  const [t, e] = await Promise.all([
+    prisma.trabajo.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        numero: true,
+        titulo: true,
+        descripcion: true,
+        estado: true,
+        fechaPresupuesto: true,
+        validoHasta: true,
+        direccion: true,
+        condiciones: true,
+        cliente: { select: { nombre: true, tipo: true, telefono: true, direccion: true } },
+        items: { orderBy: { orden: "asc" }, select: SELECT_ITEM },
+      },
+    }),
+    empresaODefecto(prisma),
+  ]);
   if (!t) return null;
-  const cliente = s.clientes.find((c) => c.id === t.clienteId);
-  const items = itemsDe(s, t.id);
-  const e = s.empresa;
+
+  const items = t.items.map(aItem);
   return {
     id: t.id,
     numero: t.numero,
@@ -405,12 +472,8 @@ export async function obtenerPresupuesto(id: string): Promise<Presupuesto | null
     estado: t.estado,
     fechaPresupuesto: t.fechaPresupuesto,
     validoHasta: t.validoHasta,
-    direccion: t.direccion ?? cliente?.direccion ?? null,
-    cliente: {
-      nombre: cliente?.nombre ?? "Cliente borrado",
-      tipo: cliente?.tipo ?? "PARTICULAR",
-      telefono: cliente?.telefono ?? null,
-    },
+    direccion: t.direccion ?? t.cliente.direccion,
+    cliente: { nombre: t.cliente.nombre, tipo: t.cliente.tipo, telefono: t.cliente.telefono },
     items,
     total: totalItems(items),
     condiciones: t.condiciones ?? e.condicionesPresupuesto,
@@ -428,52 +491,71 @@ export async function obtenerPresupuesto(id: string): Promise<Presupuesto | null
 
 /** Número, título y cliente (para el título de la pestaña). */
 export async function resumenTrabajo(id: string): Promise<{ numero: number; titulo: string; cliente: string } | null> {
-  const s = await leerStore();
-  const t = s.trabajos.find((x) => x.id === id);
+  const prisma = await leerDb();
+  const t = await prisma.trabajo.findUnique({
+    where: { id },
+    select: { numero: true, titulo: true, cliente: { select: { nombre: true } } },
+  });
   if (!t) return null;
-  return {
-    numero: t.numero,
-    titulo: t.titulo,
-    cliente: s.clientes.find((c) => c.id === t.clienteId)?.nombre ?? "Cliente borrado",
-  };
+  return { numero: t.numero, titulo: t.titulo, cliente: t.cliente.nombre };
 }
 
 /** Clientes, insumos y valores por defecto para armar un presupuesto nuevo. */
 export async function datosNuevoTrabajo(): Promise<DatosNuevoTrabajo> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = ahora();
+  const [clientes, insumos, empresa] = await Promise.all([
+    prisma.cliente.findMany({ select: { id: true, nombre: true, direccion: true } }),
+    insumosParaItems(prisma),
+    empresaODefecto(prisma),
+  ]);
   return {
-    clientes: clientesParaTrabajo(s),
-    insumos: insumosParaItems(s),
-    validoHasta: aInputFecha(sumarDias(hoy, s.empresa.validezPresupuestoDias)),
-    condiciones: s.empresa.condicionesPresupuesto ?? "",
+    clientes: clientes.sort(porNombre),
+    insumos,
+    validoHasta: aInputFecha(sumarDias(hoy, empresa.validezPresupuestoDias)),
+    condiciones: empresa.condicionesPresupuesto ?? "",
   };
 }
 
 /** Un trabajo con sus ítems, listo para el formulario de edición. `null` si no existe. */
 export async function obtenerTrabajoParaEditar(id: string): Promise<TrabajoParaEditar | null> {
-  const s = await leerStore();
-  const t = s.trabajos.find((x) => x.id === id);
+  const prisma = await leerDb();
+  const [t, insumos, empresa] = await Promise.all([
+    prisma.trabajo.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        numero: true,
+        estado: true,
+        titulo: true,
+        tipo: true,
+        direccion: true,
+        descripcion: true,
+        condiciones: true,
+        validoHasta: true,
+        cliente: { select: { id: true, nombre: true, direccion: true } },
+        items: {
+          orderBy: { orden: "asc" },
+          select: { descripcion: true, cantidad: true, unidad: true, precioUnitario: true, insumoId: true },
+        },
+      },
+    }),
+    insumosParaItems(prisma),
+    empresaODefecto(prisma),
+  ]);
   if (!t) return null;
-  const cliente = s.clientes.find((c) => c.id === t.clienteId);
   return {
     id: t.id,
     numero: t.numero,
     estado: t.estado,
-    cliente: { id: t.clienteId, nombre: cliente?.nombre ?? "Cliente borrado", direccion: cliente?.direccion ?? null },
+    cliente: t.cliente,
     titulo: t.titulo,
     tipo: t.tipo,
     direccion: t.direccion ?? "",
     descripcion: t.descripcion ?? "",
-    condiciones: t.condiciones ?? s.empresa.condicionesPresupuesto ?? "",
+    condiciones: t.condiciones ?? empresa.condicionesPresupuesto ?? "",
     validoHasta: t.validoHasta ? aInputFecha(t.validoHasta) : "",
-    items: itemsDe(s, t.id).map((i) => ({
-      descripcion: i.descripcion,
-      cantidad: i.cantidad,
-      unidad: i.unidad,
-      precioUnitario: i.precioUnitario,
-      insumoId: i.insumoId,
-    })),
-    insumos: insumosParaItems(s),
+    items: t.items,
+    insumos,
   };
 }

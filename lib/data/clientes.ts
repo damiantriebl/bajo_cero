@@ -4,10 +4,11 @@ import type {
   Equipo,
   EstadoTrabajo,
   MedioPago,
+  Prisma,
   TipoCliente,
   TipoTrabajo,
 } from "@/lib/generated/prisma/client";
-import { ahora, leerStore, type Store } from "@/lib/mock/store";
+import { ahora, leerDb } from "@/lib/db";
 import { avanceCobro, saldo, totalItems } from "@/lib/calculos";
 import { diasHasta, inicioDia } from "@/lib/fechas";
 
@@ -15,7 +16,7 @@ import { diasHasta, inicioDia } from "@/lib/fechas";
 // Regla: suman como deuda los trabajos APROBADO, EN_CURSO, TERMINADO y COBRADO.
 // PRESUPUESTO (sin aprobar) y CANCELADO no cuentan.
 
-const ESTADOS_CON_DEUDA: readonly EstadoTrabajo[] = ["APROBADO", "EN_CURSO", "TERMINADO", "COBRADO"];
+export const ESTADOS_CON_DEUDA: readonly EstadoTrabajo[] = ["APROBADO", "EN_CURSO", "TERMINADO", "COBRADO"];
 
 export function cuentaComoDeuda(estado: EstadoTrabajo): boolean {
   return ESTADOS_CON_DEUDA.includes(estado);
@@ -41,7 +42,7 @@ export type Cuenta = {
 
 // ───────── Ayudas internas (también las usa lib/data/cobros.ts) ─────────
 
-function agrupar<T>(filas: T[], clave: (f: T) => string | null): Map<string, T[]> {
+export function agrupar<T>(filas: T[], clave: (f: T) => string | null): Map<string, T[]> {
   const m = new Map<string, T[]>();
   for (const f of filas) {
     const k = clave(f);
@@ -53,18 +54,32 @@ function agrupar<T>(filas: T[], clave: (f: T) => string | null): Map<string, T[]
   return m;
 }
 
-/** Total (suma de ítems) y cobrado de cada trabajo. */
-export function totalesPorTrabajo(s: Store): Map<string, { total: number; pagado: number }> {
-  const items = agrupar(s.items, (i) => i.trabajoId);
-  const cobros = agrupar(s.cobros, (c) => c.trabajoId);
-  const out = new Map<string, { total: number; pagado: number }>();
-  for (const t of s.trabajos) {
-    out.set(t.id, {
-      total: totalItems(items.get(t.id) ?? []),
-      pagado: (cobros.get(t.id) ?? []).reduce((a, c) => a + c.monto, 0),
-    });
-  }
+/** Ítems (de varios trabajos) → total de cada trabajo, con totalItems(). */
+export function totalPorTrabajo(items: { trabajoId: string; cantidad: number; precioUnitario: number }[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const [trabajoId, lista] of agrupar(items, (i) => i.trabajoId)) out.set(trabajoId, totalItems(lista));
   return out;
+}
+
+/** Lo que hace falta de cada ítem para totalPorTrabajo(). */
+export const SELECT_ITEM = { trabajoId: true, cantidad: true, precioUnitario: true } as const;
+
+/**
+ * Lo cobrado, sumado en la base (una sola consulta, sin traer cada cobro):
+ * por cliente (todos sus cobros, con o sin trabajo) y por trabajo.
+ */
+export async function cobradoAgrupado(
+  prisma: Prisma.TransactionClient,
+): Promise<{ porCliente: Map<string, number>; porTrabajo: Map<string, number> }> {
+  const grupos = await prisma.cobro.groupBy({ by: ["clienteId", "trabajoId"], _sum: { monto: true } });
+  const porCliente = new Map<string, number>();
+  const porTrabajo = new Map<string, number>();
+  for (const g of grupos) {
+    const monto = g._sum.monto ?? 0;
+    porCliente.set(g.clienteId, (porCliente.get(g.clienteId) ?? 0) + monto);
+    if (g.trabajoId) porTrabajo.set(g.trabajoId, (porTrabajo.get(g.trabajoId) ?? 0) + monto);
+  }
+  return { porCliente, porTrabajo };
 }
 
 /**
@@ -95,20 +110,6 @@ export function calcularCuenta(trabajos: { estado: EstadoTrabajo; total: number;
   };
 }
 
-/** Cuenta de cada cliente (por id). */
-export function cuentasPorCliente(s: Store): Map<string, Cuenta> {
-  const totales = totalesPorTrabajo(s);
-  const trabajos = agrupar(s.trabajos, (t) => t.clienteId);
-  const cobros = agrupar(s.cobros, (c) => c.clienteId);
-  const out = new Map<string, Cuenta>();
-  for (const c of s.clientes) {
-    const filas = (trabajos.get(c.id) ?? []).map((t) => ({ estado: t.estado, ...(totales.get(t.id) ?? { total: 0, pagado: 0 }) }));
-    const pagado = (cobros.get(c.id) ?? []).reduce((a, x) => a + x.monto, 0);
-    out.set(c.id, calcularCuenta(filas, pagado));
-  }
-  return out;
-}
-
 const normalizar = (t: string) =>
   t
     .normalize("NFD")
@@ -116,7 +117,9 @@ const normalizar = (t: string) =>
     .toLowerCase()
     .trim();
 
-function coincide(c: Cliente, q: string): boolean {
+type CamposBusqueda = Pick<Cliente, "nombre" | "direccion" | "localidad" | "telefono">;
+
+function coincide(c: CamposBusqueda, q: string): boolean {
   const texto = normalizar(q);
   if (!texto) return true;
   const campos = [c.nombre, c.direccion, c.localidad, c.telefono].filter((x): x is string => Boolean(x)).map(normalizar);
@@ -153,26 +156,55 @@ export type ListadoClientes = {
 };
 
 export async function listarClientes({ q = "", filtro = "todos" }: { q?: string; filtro?: FiltroClientes } = {}): Promise<ListadoClientes> {
-  const s = await leerStore();
-  const cuentas = cuentasPorCliente(s);
-  const totales = totalesPorTrabajo(s);
-  const trabajosPorCliente = agrupar(s.trabajos, (t) => t.clienteId);
+  const prisma = await leerDb();
 
-  const todas: FilaCliente[] = s.clientes.map((c) => {
-    const cuenta = cuentas.get(c.id)!;
-    const trabajos = (trabajosPorCliente.get(c.id) ?? [])
-      .filter((t) => t.estado !== "CANCELADO")
-      .map((t) => {
-        const tt = totales.get(t.id) ?? { total: 0, pagado: 0 };
-        return { ...t, ...tt, falta: cuentaComoDeuda(t.estado) ? saldo(tt.total, tt.pagado) : 0 };
-      })
-      .sort((a, b) => b.fechaPresupuesto.getTime() - a.fechaPresupuesto.getTime());
+  // "Por cobrar en total" y los conteos necesitan la cuenta de TODOS los clientes,
+  // así que se traen todos (pocas columnas) y la búsqueda se aplica en memoria:
+  // ignora tildes ("Gomez" encuentra "Gómez") y compara teléfonos solo por dígitos.
+  // CANCELADO no se trae: no suma deuda ni se muestra como trabajo del cliente.
+  // Los ítems van en una consulta aparte (en paralelo) para no esperar a los trabajos.
+  const noCancelado = { estado: { not: "CANCELADO" } } as const;
+  const [clientes, trabajosDb, itemsDb, cobrado] = await Promise.all([
+    prisma.cliente.findMany({
+      select: { id: true, nombre: true, tipo: true, telefono: true, direccion: true, localidad: true },
+      orderBy: { nombre: "asc" },
+    }),
+    prisma.trabajo.findMany({
+      where: noCancelado,
+      select: { id: true, clienteId: true, titulo: true, estado: true },
+      orderBy: [{ fechaPresupuesto: "desc" }, { numero: "desc" }],
+    }),
+    prisma.itemTrabajo.findMany({ where: { trabajo: noCancelado }, select: SELECT_ITEM }),
+    cobradoAgrupado(prisma),
+  ]);
+  const totales = totalPorTrabajo(itemsDb);
+
+  // Del más reciente al más viejo (orden de la consulta).
+  const trabajosPorCliente = agrupar(
+    trabajosDb.map((t) => {
+      const total = totales.get(t.id) ?? 0;
+      const pagado = cobrado.porTrabajo.get(t.id) ?? 0;
+      return {
+        clienteId: t.clienteId,
+        titulo: t.titulo,
+        estado: t.estado,
+        total,
+        pagado,
+        falta: cuentaComoDeuda(t.estado) ? saldo(total, pagado) : 0,
+      };
+    }),
+    (t) => t.clienteId,
+  );
+
+  const todas = clientes.map((c) => {
+    const trabajos = trabajosPorCliente.get(c.id) ?? [];
+    const cuenta = calcularCuenta(trabajos, cobrado.porCliente.get(c.id) ?? 0);
     const conSaldo = trabajos.filter((t) => t.falta > 0).sort((a, b) => b.falta - a.falta);
     const principal =
       cuenta.estado === "presupuesto"
         ? trabajos.find((t) => t.estado === "PRESUPUESTO")
         : (conSaldo[0] ?? trabajos.find((t) => cuentaComoDeuda(t.estado)) ?? trabajos[0]);
-    return {
+    const fila: FilaCliente = {
       id: c.id,
       nombre: c.nombre,
       tipo: c.tipo,
@@ -182,9 +214,10 @@ export async function listarClientes({ q = "", filtro = "todos" }: { q?: string;
       trabajo: principal ? { titulo: principal.titulo, total: principal.total, pagado: principal.pagado } : null,
       otrosConSaldo: Math.max(0, conSaldo.length - 1),
     };
+    return { fila, cliente: c };
   });
 
-  const buscadas = q.trim() ? s.clientes.filter((c) => coincide(c, q)).map((c) => todas.find((f) => f.id === c.id)!) : todas;
+  const buscadas = (q.trim() ? todas.filter((x) => coincide(x.cliente, q)) : todas).map((x) => x.fila);
   const conteos: Record<FiltroClientes, number> = {
     todos: buscadas.length,
     saldo: buscadas.filter((f) => f.cuenta.falta > 0).length,
@@ -200,7 +233,7 @@ export async function listarClientes({ q = "", filtro = "todos" }: { q?: string;
   return {
     clientes: filtradas,
     conteos,
-    porCobrar: todas.reduce((a, f) => a + f.cuenta.falta, 0),
+    porCobrar: todas.reduce((a, x) => a + x.fila.cuenta.falta, 0),
     faltaListados: filtradas.reduce((a, f) => a + f.cuenta.falta, 0),
   };
 }
@@ -257,28 +290,45 @@ const ORDEN_ESTADO: Record<EstadoTrabajo, number> = {
 };
 
 export async function obtenerCliente(id: string): Promise<DetalleCliente | null> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = ahora();
-  const cliente = s.clientes.find((c) => c.id === id);
+
+  // Todo en paralelo (una sola espera a la base); se une en memoria.
+  const deEsteCliente = { trabajo: { is: { clienteId: id } } };
+  const [cliente, trabajosDb, itemsDb, turnosDb, cobradoPorTrabajo, cobrosDb, equiposDb] = await Promise.all([
+    prisma.cliente.findUnique({ where: { id } }),
+    prisma.trabajo.findMany({
+      where: { clienteId: id },
+      select: { id: true, numero: true, titulo: true, tipo: true, estado: true, fechaPresupuesto: true },
+    }),
+    prisma.itemTrabajo.findMany({ where: deEsteCliente, select: SELECT_ITEM }),
+    // Visitas pendientes desde hoy (la primera de cada trabajo es la próxima).
+    prisma.turno.findMany({
+      where: { ...deEsteCliente, estado: { notIn: ["CANCELADO", "REALIZADO"] }, inicio: { gte: inicioDia(hoy) } },
+      orderBy: { inicio: "asc" },
+      select: { trabajoId: true, inicio: true },
+    }),
+    // Lo cobrado de cada trabajo del cliente (sumado en la base).
+    prisma.cobro.groupBy({ by: ["trabajoId"], where: deEsteCliente, _sum: { monto: true } }),
+    prisma.cobro.findMany({
+      where: { clienteId: id },
+      orderBy: [{ fecha: "desc" }, { createdAt: "desc" }],
+      select: { id: true, fecha: true, monto: true, medio: true, concepto: true, notas: true, trabajoId: true },
+    }),
+    prisma.equipo.findMany({ where: { clienteId: id }, orderBy: [{ createdAt: "asc" }, { id: "asc" }] }),
+  ]);
   if (!cliente) return null;
 
-  const totales = totalesPorTrabajo(s);
-  const desde = inicioDia(hoy).getTime();
-  const trabajosDb = s.trabajos.filter((t) => t.clienteId === id);
+  const totales = totalPorTrabajo(itemsDb);
+  const pagadoPorTrabajo = new Map(cobradoPorTrabajo.map((g) => [g.trabajoId, g._sum.monto ?? 0]));
+  const proximoTurno = new Map<string, Date>();
+  for (const t of turnosDb) if (!proximoTurno.has(t.trabajoId)) proximoTurno.set(t.trabajoId, t.inicio);
 
   const trabajos: TrabajoDeCliente[] = trabajosDb
     .map((t) => {
-      const { total, pagado } = totales.get(t.id) ?? { total: 0, pagado: 0 };
+      const total = totales.get(t.id) ?? 0;
+      const pagado = pagadoPorTrabajo.get(t.id) ?? 0;
       const deuda = cuentaComoDeuda(t.estado);
-      const proximo = s.turnos
-        .filter(
-          (x) =>
-            x.trabajoId === t.id &&
-            x.estado !== "CANCELADO" &&
-            x.estado !== "REALIZADO" &&
-            x.inicio.getTime() >= desde,
-        )
-        .sort((a, b) => a.inicio.getTime() - b.inicio.getTime())[0];
       return {
         id: t.id,
         numero: t.numero,
@@ -289,7 +339,7 @@ export async function obtenerCliente(id: string): Promise<DetalleCliente | null>
         pagado,
         falta: deuda ? saldo(total, pagado) : 0,
         cuentaComoDeuda: deuda,
-        proximoTurno: proximo?.inicio ?? null,
+        proximoTurno: proximoTurno.get(t.id) ?? null,
         fechaPresupuesto: t.fechaPresupuesto,
       };
     })
@@ -299,29 +349,15 @@ export async function obtenerCliente(id: string): Promise<DetalleCliente | null>
     );
 
   const porId = new Map(trabajosDb.map((t) => [t.id, t]));
-  const cobros: CobroDeCliente[] = s.cobros
-    .filter((c) => c.clienteId === id)
-    .sort((a, b) => b.fecha.getTime() - a.fecha.getTime())
-    .map((c) => {
-      const t = c.trabajoId ? porId.get(c.trabajoId) : undefined;
-      return {
-        id: c.id,
-        fecha: c.fecha,
-        monto: c.monto,
-        medio: c.medio,
-        concepto: c.concepto,
-        notas: c.notas,
-        trabajo: t ? { id: t.id, numero: t.numero, titulo: t.titulo } : null,
-      };
-    });
+  const cobros: CobroDeCliente[] = cobrosDb.map(({ trabajoId, ...c }) => {
+    const t = trabajoId ? porId.get(trabajoId) : undefined;
+    return { ...c, trabajo: t ? { id: t.id, numero: t.numero, titulo: t.titulo } : null };
+  });
 
-  const equipos: EquipoDeCliente[] = s.equipos
-    .filter((e) => e.clienteId === id)
-    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
-    .map((e) => ({
-      ...e,
-      diasParaMantenimiento: e.proximoMantenimiento ? diasHasta(e.proximoMantenimiento, hoy) : null,
-    }));
+  const equipos: EquipoDeCliente[] = equiposDb.map((e) => ({
+    ...e,
+    diasParaMantenimiento: e.proximoMantenimiento ? diasHasta(e.proximoMantenimiento, hoy) : null,
+  }));
 
   const cuenta = calcularCuenta(trabajos, cobros.reduce((a, c) => a + c.monto, 0));
 
@@ -330,13 +366,12 @@ export async function obtenerCliente(id: string): Promise<DetalleCliente | null>
 
 /** Datos del cliente para el formulario de edición. */
 export async function obtenerDatosCliente(id: string): Promise<Cliente | null> {
-  const s = await leerStore();
-  return s.clientes.find((c) => c.id === id) ?? null;
+  const prisma = await leerDb();
+  return prisma.cliente.findUnique({ where: { id } });
 }
 
 /** Nombre del cliente (para encabezados de pantallas hijas). */
 export async function obtenerNombreCliente(id: string): Promise<{ id: string; nombre: string } | null> {
-  const s = await leerStore();
-  const c = s.clientes.find((x) => x.id === id);
-  return c ? { id: c.id, nombre: c.nombre } : null;
+  const prisma = await leerDb();
+  return prisma.cliente.findUnique({ where: { id }, select: { id: true, nombre: true } });
 }

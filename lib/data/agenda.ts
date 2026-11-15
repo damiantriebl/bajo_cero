@@ -1,7 +1,7 @@
 import "server-only";
-import type { Turno } from "@/lib/generated/prisma/client";
+import type { Prisma, PrismaClient } from "@/lib/generated/prisma/client";
 import type { EstadoTrabajo, EstadoTurno, TipoTrabajo } from "@/lib/generated/prisma/enums";
-import { ahora, leerStore, type Store } from "@/lib/mock/store";
+import { ahora, leerDb } from "@/lib/db";
 import { aInputFecha, finDia, inicioDia, inicioSemana, mismoDia, parseFechaInput, sumarDias } from "@/lib/fechas";
 import { saldo, sumaMontos, totalItems } from "@/lib/calculos";
 
@@ -60,67 +60,99 @@ const CERRADOS: EstadoTrabajo[] = ["COBRADO", "CANCELADO"];
 
 // ───────── Ayudas internas de lib/data (también las usa lib/data/inicio.ts) ─────────
 
-/** Arma las visitas de una lista de turnos, ordenadas por hora. */
-export function armarVisitas(s: Store, turnos: Turno[]): Visita[] {
-  const visitas: Visita[] = [];
-  for (const t of [...turnos].sort((a, b) => a.inicio.getTime() - b.inicio.getTime())) {
-    const trabajo = s.trabajos.find((x) => x.id === t.trabajoId);
-    const cliente = trabajo && s.clientes.find((c) => c.id === trabajo.clienteId);
-    if (!trabajo || !cliente) continue;
-    const ids = new Set(s.turnoTecnicos.filter((x) => x.turnoId === t.id).map((x) => x.empleadoId));
-    visitas.push({
+/** Técnicos en el orden en que se cargaron. */
+export const ORDEN_EMPLEADOS = [{ createdAt: "asc" }, { nombre: "asc" }] satisfies Prisma.EmpleadoOrderByWithRelationInput[];
+
+/** Visitas por hora (y, a igual hora, por orden de carga). */
+export const ORDEN_VISITAS = [{ inicio: "asc" }, { createdAt: "asc" }] satisfies Prisma.TurnoOrderByWithRelationInput[];
+
+/** Lo que hay que leer de un turno para armar una `Visita`. */
+export const SELECT_VISITA = {
+  id: true,
+  inicio: true,
+  fin: true,
+  estado: true,
+  notas: true,
+  tecnicos: { select: { id: true, nombre: true }, orderBy: ORDEN_EMPLEADOS },
+  trabajo: {
+    select: {
+      id: true,
+      numero: true,
+      titulo: true,
+      tipo: true,
+      estado: true,
+      direccion: true,
+      cliente: { select: { id: true, nombre: true, telefono: true, direccion: true } },
+    },
+  },
+} satisfies Prisma.TurnoSelect;
+
+type TurnoVisita = Prisma.TurnoGetPayload<{ select: typeof SELECT_VISITA }>;
+
+/** Arma una visita a partir de un turno leído con `SELECT_VISITA`. */
+export function aVisita(t: TurnoVisita): Visita {
+  const { trabajo } = t;
+  const { cliente } = trabajo;
+  return {
+    id: t.id,
+    inicio: t.inicio,
+    fin: t.fin,
+    estado: t.estado,
+    notas: t.notas,
+    tecnicos: t.tecnicos,
+    trabajo: { id: trabajo.id, numero: trabajo.numero, titulo: trabajo.titulo, tipo: trabajo.tipo, estado: trabajo.estado },
+    cliente: { id: cliente.id, nombre: cliente.nombre, telefono: cliente.telefono },
+    direccion: trabajo.direccion ?? cliente.direccion,
+  };
+}
+
+/** Trabajos aprobados o en curso sin ninguna visita (no cancelada) de hoy en adelante. */
+export function whereSinFecha(hoy: Date): Prisma.TrabajoWhereInput {
+  return {
+    estado: { in: AGENDABLES },
+    turnos: { none: { inicio: { gte: inicioDia(hoy) }, estado: { not: "CANCELADO" } } },
+  };
+}
+
+/** Trabajos que esperan fecha, con lo presupuestado y lo cobrado. */
+async function trabajosSinFecha(prisma: PrismaClient, hoy: Date): Promise<TrabajoSinFecha[]> {
+  const trabajos = await prisma.trabajo.findMany({
+    where: whereSinFecha(hoy),
+    select: {
+      id: true,
+      numero: true,
+      titulo: true,
+      estado: true,
+      cliente: { select: { nombre: true } },
+      items: { select: { cantidad: true, precioUnitario: true } },
+      cobros: { select: { monto: true } },
+    },
+    orderBy: { numero: "asc" },
+  });
+  return trabajos.map((t) => {
+    const total = totalItems(t.items);
+    const cobrado = sumaMontos(t.cobros);
+    return {
       id: t.id,
-      inicio: t.inicio,
-      fin: t.fin,
+      numero: t.numero,
+      titulo: t.titulo,
       estado: t.estado,
-      notas: t.notas,
-      tecnicos: s.empleados.filter((e) => ids.has(e.id)).map((e) => ({ id: e.id, nombre: e.nombre })),
-      trabajo: { id: trabajo.id, numero: trabajo.numero, titulo: trabajo.titulo, tipo: trabajo.tipo, estado: trabajo.estado },
-      cliente: { id: cliente.id, nombre: cliente.nombre, telefono: cliente.telefono },
-      direccion: trabajo.direccion ?? cliente.direccion,
-    });
-  }
-  return visitas;
+      cliente: t.cliente.nombre,
+      total,
+      cobrado,
+      saldo: saldo(total, cobrado),
+    };
+  });
 }
 
-/** Turnos que empiezan en el día (Argentina) de `dia`. */
-export function turnosDelDia(s: Store, dia: Date): Turno[] {
-  const desde = inicioDia(dia).getTime();
-  const hasta = finDia(dia).getTime();
-  return s.turnos.filter((t) => t.inicio.getTime() >= desde && t.inicio.getTime() <= hasta);
-}
-
-/** Trabajos aprobados o en curso sin ninguna visita de hoy en adelante. */
-export function trabajosSinFecha(s: Store, hoy: Date): TrabajoSinFecha[] {
-  const desde = inicioDia(hoy).getTime();
-  return s.trabajos
-    .filter((t) => AGENDABLES.includes(t.estado))
-    .filter((t) => !s.turnos.some((x) => x.trabajoId === t.id && x.estado !== "CANCELADO" && x.inicio.getTime() >= desde))
-    .map((t) => {
-      const total = totalItems(s.items.filter((i) => i.trabajoId === t.id));
-      const cobrado = sumaMontos(s.cobros.filter((c) => c.trabajoId === t.id));
-      return {
-        id: t.id,
-        numero: t.numero,
-        titulo: t.titulo,
-        estado: t.estado,
-        cliente: s.clientes.find((c) => c.id === t.clienteId)?.nombre ?? "",
-        total,
-        cobrado,
-        saldo: saldo(total, cobrado),
-      };
-    })
-    .sort((a, b) => a.numero - b.numero);
-}
-
-function armarDia(s: Store, fecha: Date, hoy: Date): DiaAgenda {
-  const visitas = armarVisitas(s, turnosDelDia(s, fecha));
+function armarDia(visitas: Visita[], fecha: Date, hoy: Date): DiaAgenda {
+  const delDia = visitas.filter((v) => mismoDia(v.inicio, fecha));
   return {
     iso: aInputFecha(fecha),
     fecha,
     esHoy: mismoDia(fecha, hoy),
-    visitas,
-    cantidad: visitas.filter((v) => v.estado !== "CANCELADO").length,
+    visitas: delDia,
+    cantidad: delDia.filter((v) => v.estado !== "CANCELADO").length,
   };
 }
 
@@ -128,17 +160,29 @@ function armarDia(s: Store, fecha: Date, hoy: Date): DiaAgenda {
 
 /** Semana del día elegido (`"2026-11-16"`; si falta o no es válido, hoy). */
 export async function obtenerAgenda(dia?: string): Promise<Agenda> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const momento = ahora();
   const hoy = inicioDia(momento);
   const elegido = (dia && parseFechaInput(dia)) || hoy;
   const elegidoIso = aInputFecha(elegido);
 
   const lunes = inicioSemana(elegido);
-  const semana = Array.from({ length: 7 }, (_, i) => armarDia(s, sumarDias(lunes, i), hoy)).filter(
+  const domingo = sumarDias(lunes, 6);
+
+  const [turnos, sinFecha] = await Promise.all([
+    prisma.turno.findMany({
+      where: { inicio: { gte: lunes, lte: finDia(domingo) } },
+      select: SELECT_VISITA,
+      orderBy: ORDEN_VISITAS,
+    }),
+    trabajosSinFecha(prisma, hoy),
+  ]);
+  const visitas = turnos.map(aVisita);
+
+  const semana = Array.from({ length: 7 }, (_, i) => armarDia(visitas, sumarDias(lunes, i), hoy)).filter(
     (d, i) => i < 6 || d.cantidad > 0 || d.iso === elegidoIso,
   );
-  const diaElegido = semana.find((d) => d.iso === elegidoIso) ?? armarDia(s, elegido, hoy);
+  const diaElegido = semana.find((d) => d.iso === elegidoIso) ?? armarDia(visitas, elegido, hoy);
 
   return {
     ahora: momento,
@@ -147,16 +191,15 @@ export async function obtenerAgenda(dia?: string): Promise<Agenda> {
     semana,
     anterior: { dia: aInputFecha(sumarDias(elegido, -1)), semana: aInputFecha(sumarDias(elegido, -7)) },
     siguiente: { dia: aInputFecha(sumarDias(elegido, 1)), semana: aInputFecha(sumarDias(elegido, 7)) },
-    sinFecha: trabajosSinFecha(s, hoy),
+    sinFecha,
   };
 }
 
 /** Detalle de una visita, o null si no existe. */
 export async function obtenerVisita(id: string): Promise<{ visita: Visita; ahora: Date } | null> {
-  const s = await leerStore();
-  const turno = s.turnos.find((t) => t.id === id);
-  const visita = turno ? armarVisitas(s, [turno])[0] : undefined;
-  return visita ? { visita, ahora: ahora() } : null;
+  const prisma = await leerDb();
+  const turno = await prisma.turno.findUnique({ where: { id }, select: SELECT_VISITA });
+  return turno ? { visita: aVisita(turno), ahora: ahora() } : null;
 }
 
 export type OpcionesTurno = {
@@ -168,23 +211,33 @@ export type OpcionesTurno = {
 
 /** Lo que necesita el formulario de turno nuevo. */
 export async function obtenerOpcionesTurno(): Promise<OpcionesTurno> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = inicioDia(ahora());
-  const esperan = new Set(trabajosSinFecha(s, hoy).map((t) => t.id));
-  const trabajos = s.trabajos
-    .filter((t) => !CERRADOS.includes(t.estado))
+
+  const [abiertos, esperanFecha, tecnicos] = await Promise.all([
+    prisma.trabajo.findMany({
+      where: { estado: { notIn: CERRADOS } },
+      select: { id: true, numero: true, titulo: true, cliente: { select: { nombre: true } } },
+      orderBy: { numero: "desc" },
+    }),
+    prisma.trabajo.findMany({ where: whereSinFecha(hoy), select: { id: true } }),
+    prisma.empleado.findMany({
+      where: { activo: true },
+      select: { id: true, nombre: true, puesto: true },
+      orderBy: ORDEN_EMPLEADOS,
+    }),
+  ]);
+
+  const esperan = new Set(esperanFecha.map((t) => t.id));
+  const trabajos = abiertos
     .map((t) => ({
       id: t.id,
       numero: t.numero,
-      cliente: s.clientes.find((c) => c.id === t.clienteId)?.nombre ?? "",
+      cliente: t.cliente.nombre,
       titulo: t.titulo,
       sinFecha: esperan.has(t.id),
     }))
     .sort((a, b) => Number(b.sinFecha) - Number(a.sinFecha) || b.numero - a.numero);
 
-  return {
-    hoyIso: aInputFecha(hoy),
-    trabajos,
-    tecnicos: s.empleados.filter((e) => e.activo).map((e) => ({ id: e.id, nombre: e.nombre, puesto: e.puesto })),
-  };
+  return { hoyIso: aInputFecha(hoy), trabajos, tecnicos };
 }

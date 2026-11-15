@@ -20,10 +20,37 @@ import {
   nuevoTrabajo,
   nuevoTurno,
 } from "./fabricas";
-import type { Store } from "./store";
+import type {
+  ChecklistItem, Cliente, Cobro, Compra, Empleado, Empresa, Equipo, Foto, Gasto, Insumo, ItemCompra,
+  ItemTrabajo, Jornada, MovimientoStock, PagoProveedor, Proveedor, Trabajo, Turno,
+} from "@/lib/generated/prisma/client";
 import type { TipoTrabajo } from "@/lib/generated/prisma/enums";
 
-export function crearDatosDeEjemplo(ahora: Date): Store {
+/** Filas de cada tabla, listas para insertar con Prisma (ver prisma/seed.ts). */
+export type DatosDeEjemplo = {
+  empresa: Empresa;
+  clientes: Cliente[];
+  equipos: Equipo[];
+  trabajos: Trabajo[];
+  items: ItemTrabajo[];
+  checklist: ChecklistItem[];
+  fotos: Foto[];
+  turnos: Turno[];
+  /** Relación muchos-a-muchos Turno ↔ Empleado. */
+  turnoTecnicos: { turnoId: string; empleadoId: string }[];
+  cobros: Cobro[];
+  proveedores: Proveedor[];
+  compras: Compra[];
+  itemsCompra: ItemCompra[];
+  pagosProveedor: PagoProveedor[];
+  insumos: Insumo[];
+  movimientos: MovimientoStock[];
+  empleados: Empleado[];
+  jornadas: Jornada[];
+  gastos: Gasto[];
+};
+
+export function crearDatosDeEjemplo(ahora: Date): DatosDeEjemplo {
   const hoy = inicioDia(ahora);
   const p = partesAR(ahora);
 
@@ -40,7 +67,7 @@ export function crearDatosDeEjemplo(ahora: Date): Store {
     return fechaAR(q.anio, q.mes, n, hora);
   };
 
-  const s: Store = {
+  const s: DatosDeEjemplo = {
     empresa: {
       id: "empresa",
       razonSocial: "[RAZÓN SOCIAL]",

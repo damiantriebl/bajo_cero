@@ -1,0 +1,64 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - main [ref=e4]:
+      - generic [ref=e5]:
+        - link "Clientes" [ref=e6] [cursor=pointer]:
+          - /url: /clientes
+        - heading "Nuevo cliente" [level=1] [ref=e11]
+      - generic [ref=e12]:
+        - generic [ref=e13]:
+          - generic [ref=e14]:
+            - generic [ref=e15]: Nombre
+            - textbox "Nombre" [ref=e16]:
+              - /placeholder: Nombre y apellido o razón social
+          - group "Tipo" [ref=e17]:
+            - generic [ref=e19]:
+              - generic [ref=e20] [cursor=pointer]:
+                - radio "Particular" [checked] [ref=e21]
+                - text: Particular
+              - generic [ref=e22] [cursor=pointer]:
+                - radio "Empresa" [ref=e23]
+                - text: Empresa
+              - generic [ref=e24] [cursor=pointer]:
+                - radio "Consorcio" [ref=e25]
+                - text: Consorcio
+          - generic [ref=e26]:
+            - generic [ref=e27]: Teléfono
+            - textbox "Teléfono" [ref=e28]:
+              - /placeholder: 11 5555-0101
+            - paragraph [ref=e29]: Con código de área, sin 0 ni 15
+          - generic [ref=e30]:
+            - generic [ref=e31]: Email
+            - textbox "Email" [ref=e32]
+          - generic [ref=e33]:
+            - generic [ref=e34]: Dirección
+            - textbox "Dirección" [ref=e35]:
+              - /placeholder: Calle, número, piso y depto.
+          - generic [ref=e36]:
+            - generic [ref=e37]: Localidad
+            - textbox "Localidad" [ref=e38]
+          - generic [ref=e39]:
+            - generic [ref=e40]: CUIT
+            - textbox "CUIT" [ref=e41]:
+              - /placeholder: 30-12345678-9
+            - paragraph [ref=e42]: Opcional. Para empresas y consorcios.
+          - generic [ref=e43]:
+            - generic [ref=e44]: Notas
+            - textbox "Notas" [ref=e45]:
+              - /placeholder: Cómo llegar, con quién hablar, horarios…
+        - generic [ref=e46]:
+          - button "Guardar cliente" [ref=e47]
+          - link "Cancelar" [ref=e48] [cursor=pointer]:
+            - /url: /clientes
+    - navigation "Secciones" [ref=e49]:
+      - generic [ref=e50]:
+        - link "Inicio" [ref=e51] [cursor=pointer]:
+          - /url: /
+        - link "Agenda" [ref=e55] [cursor=pointer]:
+          - /url: /agenda
+        - button "Cargar turno, cobro, gasto o presupuesto" [ref=e58]
+        - link "Clientes" [ref=e60] [cursor=pointer]:
+          - /url: /clientes
+        - link "Más" [ref=e66] [cursor=pointer]:
+          - /url: /mas
+  - alert [ref=e72]

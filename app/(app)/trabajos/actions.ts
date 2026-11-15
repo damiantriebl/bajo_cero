@@ -3,11 +3,11 @@
 import { z } from "zod";
 import { redirect } from "next/navigation";
 import { refresh } from "next/cache";
-import { siguienteNumeroTrabajo, storeParaAcciones, type Store } from "@/lib/mock/store";
-import { nuevoChecklistItem, nuevoItemTrabajo, nuevoMovimiento, nuevoTrabajo } from "@/lib/mock/fabricas";
-import { EstadoTrabajo, TipoTrabajo } from "@/lib/generated/prisma/enums";
+import { db } from "@/lib/db";
+import { Prisma } from "@/lib/generated/prisma/client";
+import { EstadoTrabajo, TipoTrabajo, type Unidad } from "@/lib/generated/prisma/enums";
 import { datosDe, erroresDeZod, zCantidad, zEnum, zFechaOpcional, zTexto, zTextoOpcional, type EstadoForm } from "@/lib/forms";
-import { saldo, sumaMontos, totalItems } from "@/lib/calculos";
+import { saldo, totalItems } from "@/lib/calculos";
 import { formatNumero } from "@/lib/formato";
 import { UNIDAD } from "@/lib/etiquetas";
 import { transicionValida } from "./_components/flujo";
@@ -70,22 +70,45 @@ function erroresTrabajo(error: z.ZodError): NonNullable<EstadoForm> {
 
 type ItemValidado = z.infer<typeof zItem>;
 
-function guardarItems(s: Store, trabajoId: string, items: ItemValidado[]) {
-  const insumos = new Set(s.insumos.map((i) => i.id));
-  items.forEach((it, orden) =>
-    s.items.push(
-      nuevoItemTrabajo({
-        trabajoId,
-        descripcion: it.descripcion,
-        cantidad: it.cantidad,
-        unidad: it.unidad,
-        precioUnitario: it.precioUnitario,
-        insumoId: it.insumoId && insumos.has(it.insumoId) ? it.insumoId : null,
-        orden,
-      }),
-    ),
-  );
+// ───────── Ayudas ─────────
+
+/** Código de error de Prisma (P2003, P2025…) o `undefined` si es otro error. */
+function codigoPrisma(e: unknown): string | undefined {
+  return e instanceof Prisma.PrismaClientKnownRequestError ? e.code : undefined;
 }
+
+const TRABAJO_NO_EXISTE: EstadoForm = { error: "Este trabajo ya no existe." };
+const CLIENTE_NO_EXISTE: EstadoForm = {
+  error: "Revisá los campos marcados.",
+  errores: { clienteId: "Ese cliente ya no existe. Elegí otro." },
+};
+const MATERIAL_NO_EXISTE: EstadoForm = {
+  error: "Revisá los campos marcados.",
+  errores: { insumoId: "Ese material ya no existe." },
+};
+
+/** De los insumos que mencionan los ítems, los que existen (un ítem con un insumo borrado queda sin insumo). */
+async function insumosExistentes(items: ItemValidado[]): Promise<Set<string>> {
+  const ids = [...new Set(items.flatMap((i) => (i.insumoId ? [i.insumoId] : [])))];
+  if (ids.length === 0) return new Set();
+  const filas = await db().insumo.findMany({ where: { id: { in: ids } }, select: { id: true } });
+  return new Set(filas.map((f) => f.id));
+}
+
+/** Filas de ItemTrabajo en el orden del formulario. */
+function filasItems(items: ItemValidado[], insumos: Set<string>) {
+  return items.map((it, orden) => ({
+    descripcion: it.descripcion,
+    cantidad: it.cantidad,
+    unidad: it.unidad,
+    precioUnitario: it.precioUnitario,
+    insumoId: it.insumoId && insumos.has(it.insumoId) ? it.insumoId : null,
+    orden,
+  }));
+}
+
+/** Stock con 3 decimales como máximo (evita restos de punto flotante: 0,30000000004). */
+const redondearStock = (n: number) => Math.round(n * 1000) / 1000;
 
 // ───────── Presupuesto: crear y editar ─────────
 
@@ -94,30 +117,38 @@ export async function crearTrabajo(_prev: EstadoForm, formData: FormData): Promi
   if (!r.success) return erroresTrabajo(r.error);
   const d = r.data;
 
-  const s = storeParaAcciones();
-  if (!s.clientes.some((c) => c.id === d.clienteId)) {
-    return { error: "Revisá los campos marcados.", errores: { clienteId: "Ese cliente ya no existe. Elegí otro." } };
+  const [cliente, insumos] = await Promise.all([
+    db().cliente.findUnique({ where: { id: d.clienteId }, select: { id: true } }),
+    insumosExistentes(d.items),
+  ]);
+  if (!cliente) return CLIENTE_NO_EXISTE;
+
+  let id: string;
+  try {
+    // El número de presupuesto (autoincremental) y la fecha los pone la base.
+    const trabajo = await db().trabajo.create({
+      data: {
+        clienteId: d.clienteId,
+        titulo: d.titulo,
+        tipo: d.tipo,
+        direccion: d.direccion,
+        descripcion: d.descripcion,
+        condiciones: d.condiciones,
+        validoHasta: d.validoHasta,
+        items: { create: filasItems(d.items, insumos) },
+      },
+      select: { id: true },
+    });
+    id = trabajo.id;
+  } catch (e) {
+    // Se borró el cliente (o un insumo) entre la verificación y el alta.
+    if (codigoPrisma(e) === "P2003") {
+      return { error: "El cliente o un material de los ítems ya no existe. Recargá la página y probá de nuevo." };
+    }
+    throw e;
   }
 
-  const ahora = new Date();
-  const trabajo = nuevoTrabajo(
-    {
-      clienteId: d.clienteId,
-      numero: siguienteNumeroTrabajo(s),
-      titulo: d.titulo,
-      tipo: d.tipo,
-      direccion: d.direccion,
-      descripcion: d.descripcion,
-      condiciones: d.condiciones,
-      validoHasta: d.validoHasta,
-      fechaPresupuesto: ahora,
-    },
-    ahora,
-  );
-  s.trabajos.push(trabajo);
-  guardarItems(s, trabajo.id, d.items);
-
-  redirect(`/trabajos/${trabajo.id}`);
+  redirect(`/trabajos/${id}`);
 }
 
 export async function editarTrabajo(id: string, _prev: EstadoForm, formData: FormData): Promise<EstadoForm> {
@@ -125,21 +156,31 @@ export async function editarTrabajo(id: string, _prev: EstadoForm, formData: For
   if (!r.success) return erroresTrabajo(r.error);
   const d = r.data;
 
-  const s = storeParaAcciones();
-  const trabajo = s.trabajos.find((t) => t.id === id);
-  if (!trabajo) return { error: "Este trabajo ya no existe." };
-
-  Object.assign(trabajo, {
-    titulo: d.titulo,
-    tipo: d.tipo,
-    direccion: d.direccion,
-    descripcion: d.descripcion,
-    condiciones: d.condiciones,
-    validoHasta: d.validoHasta,
-    updatedAt: new Date(),
-  });
-  s.items = s.items.filter((i) => i.trabajoId !== id);
-  guardarItems(s, id, d.items);
+  const insumos = await insumosExistentes(d.items);
+  try {
+    await db().$transaction(async (tx) => {
+      // Si el trabajo no existe, update tira P2025 y no se toca nada.
+      await tx.trabajo.update({
+        where: { id },
+        data: {
+          titulo: d.titulo,
+          tipo: d.tipo,
+          direccion: d.direccion,
+          descripcion: d.descripcion,
+          condiciones: d.condiciones,
+          validoHasta: d.validoHasta,
+        },
+        select: { id: true },
+      });
+      await tx.itemTrabajo.deleteMany({ where: { trabajoId: id } });
+      await tx.itemTrabajo.createMany({ data: filasItems(d.items, insumos).map((f) => ({ ...f, trabajoId: id })) });
+    });
+  } catch (e) {
+    const codigo = codigoPrisma(e);
+    if (codigo === "P2025") return TRABAJO_NO_EXISTE;
+    if (codigo === "P2003") return { error: "Un material de los ítems ya no existe. Recargá la página y probá de nuevo." };
+    throw e;
+  }
 
   redirect(`/trabajos/${id}`);
 }
@@ -150,18 +191,27 @@ const zEstado = zEnum(EstadoTrabajo);
 
 /** Avanza (o cancela) un trabajo. Si el cambio no corresponde, solo refresca la pantalla. */
 export async function cambiarEstado(id: string, destino: string): Promise<void> {
-  const s = storeParaAcciones();
-  const trabajo = s.trabajos.find((t) => t.id === id);
   const e = zEstado.safeParse(destino);
-  if (trabajo && e.success) {
-    const total = totalItems(s.items.filter((i) => i.trabajoId === id));
-    const cobrado = sumaMontos(s.cobros.filter((c) => c.trabajoId === id));
-    if (transicionValida(trabajo.estado, e.data, saldo(total, cobrado))) {
+  if (e.success) {
+    const [trabajo, cobros] = await Promise.all([
+      db().trabajo.findUnique({
+        where: { id },
+        select: { estado: true, items: { select: { cantidad: true, precioUnitario: true } } },
+      }),
+      db().cobro.aggregate({ where: { trabajoId: id }, _sum: { monto: true } }),
+    ]);
+    const cobrado = cobros._sum.monto ?? 0;
+    if (trabajo && transicionValida(trabajo.estado, e.data, saldo(totalItems(trabajo.items), cobrado))) {
       const ahora = new Date();
-      trabajo.estado = e.data;
-      trabajo.updatedAt = ahora;
-      if (e.data === "APROBADO") trabajo.fechaAprobado = ahora;
-      if (e.data === "TERMINADO") trabajo.fechaTerminado = ahora;
+      // Solo si sigue en el estado que se validó (dos toques seguidos no saltean pasos).
+      await db().trabajo.updateMany({
+        where: { id, estado: trabajo.estado },
+        data: {
+          estado: e.data,
+          ...(e.data === "APROBADO" && { fechaAprobado: ahora }),
+          ...(e.data === "TERMINADO" && { fechaTerminado: ahora }),
+        },
+      });
     }
   }
   refresh();
@@ -178,21 +228,41 @@ const zMaterial = z.object({
 export async function registrarMaterial(trabajoId: string, _prev: EstadoForm, formData: FormData): Promise<EstadoForm> {
   const r = zMaterial.safeParse(datosDe(formData));
   if (!r.success) return erroresDeZod(r.error);
+  const { insumoId, cantidad } = r.data;
 
-  const s = storeParaAcciones();
-  if (!s.trabajos.some((t) => t.id === trabajoId)) return { error: "Este trabajo ya no existe." };
-  const insumo = s.insumos.find((i) => i.id === r.data.insumoId);
-  if (!insumo) return { error: "Revisá los campos marcados.", errores: { insumoId: "Ese material ya no existe." } };
+  const [trabajo, existe] = await Promise.all([
+    db().trabajo.findUnique({ where: { id: trabajoId }, select: { id: true } }),
+    db().insumo.findUnique({ where: { id: insumoId }, select: { id: true } }),
+  ]);
+  if (!trabajo) return TRABAJO_NO_EXISTE;
+  if (!existe) return MATERIAL_NO_EXISTE;
 
-  const ahora = new Date();
-  const cantidad = r.data.cantidad;
-  s.movimientos.push(
-    nuevoMovimiento(
-      { insumoId: insumo.id, tipo: "CONSUMO", cantidad: -cantidad, costoUnitario: insumo.costoUnitario, trabajoId, fecha: ahora },
-      ahora,
-    ),
-  );
-  insumo.stock = Math.round((insumo.stock - cantidad) * 1000) / 1000;
+  let insumo: { nombre: string; unidad: Unidad; stock: number };
+  try {
+    insumo = await db().$transaction(async (tx) => {
+      // El update bloquea la fila hasta el commit: el costo que se copia es el
+      // vigente y nadie más mueve este stock en el medio.
+      const actualizado = await tx.insumo.update({
+        where: { id: insumoId },
+        data: { stock: { decrement: cantidad } },
+        select: { nombre: true, unidad: true, stock: true, costoUnitario: true },
+      });
+      const stock = redondearStock(actualizado.stock);
+      if (stock !== actualizado.stock) {
+        await tx.insumo.update({ where: { id: insumoId }, data: { stock }, select: { id: true } });
+      }
+      await tx.movimientoStock.create({
+        data: { insumoId, tipo: "CONSUMO", cantidad: -cantidad, costoUnitario: actualizado.costoUnitario, trabajoId },
+        select: { id: true },
+      });
+      return { nombre: actualizado.nombre, unidad: actualizado.unidad, stock };
+    });
+  } catch (e) {
+    const codigo = codigoPrisma(e);
+    if (codigo === "P2025") return MATERIAL_NO_EXISTE;
+    if (codigo === "P2003") return TRABAJO_NO_EXISTE;
+    throw e;
+  }
 
   refresh();
   const u = UNIDAD[insumo.unidad].corta;
@@ -207,9 +277,9 @@ export async function registrarMaterial(trabajoId: string, _prev: EstadoForm, fo
 // ───────── Checklist ─────────
 
 export async function alternarPaso(pasoId: string): Promise<void> {
-  const s = storeParaAcciones();
-  const paso = s.checklist.find((c) => c.id === pasoId);
-  if (paso) paso.hecho = !paso.hecho;
+  // NOT en la base: un solo viaje y no se pisa con otro toque al mismo tiempo.
+  // Si el paso ya no existe no cambia ninguna fila.
+  await db().$executeRaw`UPDATE "ChecklistItem" SET hecho = NOT hecho WHERE id = ${pasoId}`;
   refresh();
 }
 
@@ -219,10 +289,21 @@ export async function agregarPaso(trabajoId: string, _prev: EstadoForm, formData
   const r = zPaso.safeParse(datosDe(formData));
   if (!r.success) return erroresDeZod(r.error);
 
-  const s = storeParaAcciones();
-  if (!s.trabajos.some((t) => t.id === trabajoId)) return { error: "Este trabajo ya no existe." };
-  const orden = s.checklist.filter((c) => c.trabajoId === trabajoId).reduce((max, c) => Math.max(max, c.orden + 1), 0);
-  s.checklist.push(nuevoChecklistItem({ trabajoId, texto: r.data.texto, orden }));
+  const [trabajo, ultimo] = await Promise.all([
+    db().trabajo.findUnique({ where: { id: trabajoId }, select: { id: true } }),
+    db().checklistItem.aggregate({ where: { trabajoId }, _max: { orden: true } }),
+  ]);
+  if (!trabajo) return TRABAJO_NO_EXISTE;
+
+  try {
+    await db().checklistItem.create({
+      data: { trabajoId, texto: r.data.texto, orden: (ultimo._max.orden ?? -1) + 1 },
+      select: { id: true },
+    });
+  } catch (e) {
+    if (codigoPrisma(e) === "P2003") return TRABAJO_NO_EXISTE;
+    throw e;
+  }
 
   refresh();
   return null;

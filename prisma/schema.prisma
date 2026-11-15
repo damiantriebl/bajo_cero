@@ -148,6 +148,7 @@ model Trabajo {
 
   @@index([clienteId])
   @@index([estado])
+  @@index([fechaTerminado])
 }
 
 // Lo que se le cobra al cliente (forma el presupuesto).
@@ -279,7 +280,7 @@ model Compra {
   gasto       Gasto?
   pagos       PagoProveedor[]
 
-  @@index([proveedorId])
+  @@index([proveedorId, fecha])
   @@index([fecha])
 }
 
@@ -309,7 +310,7 @@ model PagoProveedor {
   notas       String?
   createdAt   DateTime  @default(now())
 
-  @@index([proveedorId])
+  @@index([proveedorId, fecha])
   @@index([compraId])
 }
 
@@ -366,6 +367,7 @@ model MovimientoStock {
 
   @@index([insumoId])
   @@index([trabajoId])
+  @@index([fecha])
 }
 
 // ───────────────────────── Personal y gastos ─────────────────────────
@@ -399,6 +401,7 @@ model Jornada {
 
   @@index([empleadoId])
   @@index([fecha])
+  @@index([trabajoId])
 }
 
 enum CategoriaGasto {
@@ -434,4 +437,6 @@ model Gasto {
 
   @@index([fecha])
   @@index([categoria])
+  @@index([trabajoId])
+  @@index([empleadoId, fecha])
 }

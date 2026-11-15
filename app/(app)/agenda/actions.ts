@@ -3,9 +3,10 @@
 import { z } from "zod";
 import { redirect } from "next/navigation";
 import { refresh, revalidatePath } from "next/cache";
+import { Prisma } from "@/lib/generated/prisma/client";
 import type { EstadoTurno } from "@/lib/generated/prisma/enums";
-import { storeParaAcciones, type Store } from "@/lib/mock/store";
-import { nuevoTurno } from "@/lib/mock/fabricas";
+import { db } from "@/lib/db";
+import { ORDEN_EMPLEADOS, ORDEN_VISITAS } from "@/lib/data/agenda";
 import { datosDe, erroresDeZod, zTexto, zTextoOpcional, type EstadoForm } from "@/lib/forms";
 import { aInputFecha, formatFechaLarga, formatHora, parseFechaInput } from "@/lib/fechas";
 import { DURACIONES, claveHorario, unirNombres } from "./_components/utilidades";
@@ -34,33 +35,58 @@ const zReprogramar = zHorario.extend({ turnoId: zTexto("Falta el turno") });
 // ───────── Ayudas ─────────
 
 /** Técnicos tildados que existen y están activos. */
-function tecnicosElegidos(s: Store, formData: FormData): string[] {
-  const ids = new Set(formData.getAll("tecnicos").filter((v): v is string => typeof v === "string"));
-  return s.empleados.filter((e) => e.activo && ids.has(e.id)).map((e) => e.id);
+async function tecnicosElegidos(formData: FormData): Promise<string[]> {
+  const ids = [...new Set(formData.getAll("tecnicos").filter((v): v is string => typeof v === "string" && v !== ""))];
+  if (ids.length === 0) return [];
+  const empleados = await db().empleado.findMany({
+    where: { id: { in: ids }, activo: true },
+    select: { id: true },
+    orderBy: ORDEN_EMPLEADOS,
+  });
+  return empleados.map((e) => e.id);
 }
 
 /** Primer turno (no cancelado) que se pisa con el horario y comparte algún técnico. */
-function buscarSuperposicion(
-  s: Store,
-  d: { inicio: Date; fin: Date; tecnicos: string[]; excluir?: string },
-): string | null {
+async function buscarSuperposicion(d: { inicio: Date; fin: Date; tecnicos: string[]; excluir?: string }): Promise<string | null> {
   if (d.tecnicos.length === 0) return null;
-  const turno = s.turnos
-    .filter((t) => t.id !== d.excluir && t.estado !== "CANCELADO")
-    .filter((t) => t.inicio < d.fin && t.fin > d.inicio)
-    .find((t) => s.turnoTecnicos.some((x) => x.turnoId === t.id && d.tecnicos.includes(x.empleadoId)));
+  const turno = await db().turno.findFirst({
+    where: {
+      ...(d.excluir ? { id: { not: d.excluir } } : {}),
+      estado: { not: "CANCELADO" },
+      inicio: { lt: d.fin },
+      fin: { gt: d.inicio },
+      tecnicos: { some: { id: { in: d.tecnicos } } },
+    },
+    select: {
+      inicio: true,
+      fin: true,
+      tecnicos: {
+        where: { id: { in: d.tecnicos } },
+        select: { nombre: true },
+        orderBy: ORDEN_EMPLEADOS,
+      },
+      trabajo: { select: { cliente: { select: { nombre: true } } } },
+    },
+    orderBy: ORDEN_VISITAS,
+  });
   if (!turno) return null;
 
-  const comunes = s.turnoTecnicos
-    .filter((x) => x.turnoId === turno.id && d.tecnicos.includes(x.empleadoId))
-    .map((x) => s.empleados.find((e) => e.id === x.empleadoId)?.nombre)
-    .filter((n): n is string => Boolean(n));
-  const trabajo = s.trabajos.find((t) => t.id === turno.trabajoId);
-  const cliente = trabajo && s.clientes.find((c) => c.id === trabajo.clienteId);
+  const comunes = turno.tecnicos.map((t) => t.nombre);
   const verbo = comunes.length > 1 ? "tienen" : "tiene";
-  return `${unirNombres(comunes)} ya ${verbo} una visita de ${formatHora(turno.inicio)} a ${formatHora(turno.fin)}${
-    cliente ? ` (${cliente.nombre})` : ""
-  }.`;
+  return `${unirNombres(comunes)} ya ${verbo} una visita de ${formatHora(turno.inicio)} a ${formatHora(turno.fin)} (${
+    turno.trabajo.cliente.nombre
+  }).`;
+}
+
+/**
+ * Errores de Prisma que puede provocar el usuario (p. ej. alguien borró el
+ * trabajo o un técnico mientras se completaba el formulario).
+ */
+function esFaltaDeRegistro(e: unknown): boolean {
+  return (
+    e instanceof Prisma.PrismaClientKnownRequestError &&
+    (e.code === "P2025" || e.code === "P2018" || e.code === "P2003")
+  );
 }
 
 function actualizarPantallas() {
@@ -75,10 +101,12 @@ export async function crearTurno(_prev: EstadoForm, formData: FormData): Promise
   const r = zNuevoTurno.safeParse(datos);
   if (!r.success) return erroresDeZod(r.error);
 
-  const s = storeParaAcciones();
   const { fecha, hora, duracion, trabajoId, estado, notas } = r.data;
 
-  const trabajo = s.trabajos.find((t) => t.id === trabajoId);
+  const [trabajo, tecnicos] = await Promise.all([
+    db().trabajo.findUnique({ where: { id: trabajoId }, select: { estado: true } }),
+    tecnicosElegidos(formData),
+  ]);
   if (!trabajo || trabajo.estado === "COBRADO" || trabajo.estado === "CANCELADO") {
     return { error: "Revisá los campos marcados.", errores: { trabajoId: "Elegí un trabajo que no esté cobrado ni cancelado" } };
   }
@@ -86,18 +114,32 @@ export async function crearTurno(_prev: EstadoForm, formData: FormData): Promise
   const inicio = parseFechaInput(fecha, hora);
   if (!inicio) return { error: "Revisá los campos marcados.", errores: { fecha: "Elegí una fecha" } };
   const fin = new Date(inicio.getTime() + duracion * 60_000);
-  const tecnicos = tecnicosElegidos(s, formData);
 
   // Si se pisa con otra visita, avisar una vez; si reenvía igual, se agenda.
   const clave = claveHorario({ fecha: datos.fecha, hora: datos.hora, duracion: datos.duracion, tecnicos, extra: trabajoId });
   if (datos.confirmar !== clave) {
-    const choque = buscarSuperposicion(s, { inicio, fin, tecnicos });
+    const choque = await buscarSuperposicion({ inicio, fin, tecnicos });
     if (choque) return { error: choque, errores: { confirmar: clave } };
   }
 
-  const turno = nuevoTurno({ trabajoId, inicio, fin, estado, notas });
-  s.turnos.push(turno);
-  tecnicos.forEach((empleadoId) => s.turnoTecnicos.push({ turnoId: turno.id, empleadoId }));
+  try {
+    await db().turno.create({
+      data: {
+        trabajo: { connect: { id: trabajoId } },
+        inicio,
+        fin,
+        estado,
+        notas,
+        tecnicos: { connect: tecnicos.map((id) => ({ id })) },
+      },
+      select: { id: true },
+    });
+  } catch (e) {
+    if (esFaltaDeRegistro(e)) {
+      return { error: "El trabajo o alguno de los técnicos ya no existe. Recargá la página y probá de nuevo." };
+    }
+    throw e;
+  }
 
   actualizarPantallas();
   redirect(`/agenda?dia=${aInputFecha(inicio)}`);
@@ -110,27 +152,34 @@ export async function reprogramarTurno(_prev: EstadoForm, formData: FormData): P
   const r = zReprogramar.safeParse(datos);
   if (!r.success) return erroresDeZod(r.error);
 
-  const s = storeParaAcciones();
   const { turnoId, fecha, hora, duracion } = r.data;
-  const turno = s.turnos.find((t) => t.id === turnoId);
+  const turno = await db().turno.findUnique({
+    where: { id: turnoId },
+    select: { estado: true, tecnicos: { select: { id: true } } },
+  });
   if (!turno) return { error: "Esta visita ya no existe." };
   if (turno.estado === "REALIZADO") return { error: "La visita ya se hizo: agendá una nueva." };
 
   const inicio = parseFechaInput(fecha, hora);
   if (!inicio) return { error: "Revisá los campos marcados.", errores: { fecha: "Elegí una fecha" } };
   const fin = new Date(inicio.getTime() + duracion * 60_000);
-  const tecnicos = s.turnoTecnicos.filter((x) => x.turnoId === turno.id).map((x) => x.empleadoId);
+  const tecnicos = turno.tecnicos.map((t) => t.id);
 
   const clave = claveHorario({ fecha: datos.fecha, hora: datos.hora, duracion: datos.duracion, tecnicos, extra: turnoId });
   if (datos.confirmar !== clave) {
-    const choque = buscarSuperposicion(s, { inicio, fin, tecnicos, excluir: turno.id });
+    const choque = await buscarSuperposicion({ inicio, fin, tecnicos, excluir: turnoId });
     if (choque) return { error: choque, errores: { confirmar: clave } };
   }
 
-  turno.inicio = inicio;
-  turno.fin = fin;
   // Un horario nuevo hay que volver a confirmarlo con el cliente.
-  if (turno.estado !== "A_CONFIRMAR") turno.estado = "A_CONFIRMAR";
+  // El filtro por estado evita pisar una visita que se marcó realizada mientras tanto.
+  const { count } = await db().turno.updateMany({
+    where: { id: turnoId, estado: { not: "REALIZADO" } },
+    data: { inicio, fin, estado: "A_CONFIRMAR" },
+  });
+  if (count === 0) {
+    return { error: "Esta visita cambió recién (se borró o ya se hizo). Recargá la página para verla." };
+  }
 
   actualizarPantallas();
   refresh();
@@ -140,9 +189,8 @@ export async function reprogramarTurno(_prev: EstadoForm, formData: FormData): P
 // ───────── Cambios de estado (botones) ─────────
 
 async function cambiarEstado(id: string, estado: EstadoTurno, desde: EstadoTurno[]) {
-  const s = storeParaAcciones();
-  const turno = s.turnos.find((t) => t.id === id);
-  if (turno && desde.includes(turno.estado)) turno.estado = estado;
+  // Solo cambia si el turno sigue en uno de los estados de origen (si no existe, no hace nada).
+  await db().turno.updateMany({ where: { id, estado: { in: desde } }, data: { estado } });
   actualizarPantallas();
   refresh();
 }

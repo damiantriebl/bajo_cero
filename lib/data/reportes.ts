@@ -1,19 +1,22 @@
 import "server-only";
-import { ahora, leerStore, type Store } from "@/lib/mock/store";
+import { ahora, leerDb } from "@/lib/db";
 import {
-  diasHasta,
-  entre,
   fechaAR,
+  finDia,
   finMes,
   formatMes,
   formatMesCorto,
+  inicioDia,
   inicioMes,
   partesAR,
+  sumarDias,
   sumarMeses,
 } from "@/lib/fechas";
 import { costoConsumos, estadoStock, rentabilidad, sumaMontos, totalItems } from "@/lib/calculos";
 import { CATEGORIA_GASTO, MEDIO_PAGO, TIPO_TRABAJO } from "@/lib/etiquetas";
-import type { CategoriaGasto, EstadoTrabajo, TipoTrabajo } from "@/lib/generated/prisma/enums";
+import type { PrismaClient } from "@/lib/generated/prisma/client";
+import type { CategoriaGasto, TipoTrabajo } from "@/lib/generated/prisma/enums";
+import { datosEmpresa } from "./empresa";
 
 // ───────────────────────── Período (mes elegido con ?mes=YYYY-MM) ─────────────────────────
 
@@ -87,15 +90,14 @@ export function resolverMes(clave: string | undefined, hoy: Date): Periodo {
 
 /** Solo la info del mes (para el selector del encabezado). */
 export async function infoMes(clave: string | undefined): Promise<MesInfo> {
-  await leerStore();
+  await leerDb();
   return resolverMes(clave, ahora()).info;
 }
 
 // ───────────────────────── Ayudas compartidas por lib/data ─────────────────────────
 
-export function delPeriodo<T extends { fecha: Date }>(filas: T[], desde: Date, hasta: Date): T[] {
-  return filas.filter((f) => entre(f.fecha, desde, hasta));
-}
+/** Filtro de Prisma para un campo DateTime dentro del período (bordes incluidos). */
+export const enRango = (desde: Date, hasta: Date) => ({ gte: desde, lte: hasta });
 
 export type CategoriaResumen = { categoria: CategoriaGasto; label: string; monto: number; fraccion: number };
 
@@ -114,17 +116,37 @@ export function porCategoria(gastos: { categoria: CategoriaGasto; monto: number 
     .sort((a, b) => b.monto - a.monto);
 }
 
-const ESTADOS_CON_SALDO: EstadoTrabajo[] = ["APROBADO", "EN_CURSO", "TERMINADO", "COBRADO"];
+/** Gastos del período agrupados por categoría en la base (SUM … GROUP BY categoria). */
+export async function gastosPorCategoria(prisma: PrismaClient, desde: Date, hasta: Date): Promise<CategoriaResumen[]> {
+  const grupos = await prisma.gasto.groupBy({
+    by: ["categoria"],
+    where: { fecha: enRango(desde, hasta) },
+    _sum: { monto: true },
+  });
+  return porCategoria(grupos.map((g) => ({ categoria: g.categoria, monto: g._sum.monto ?? 0 })));
+}
 
-/** Lo que falta cobrar hoy de los trabajos aprobados en adelante (no depende del mes). */
-export function totalPorCobrar(s: Store): number {
-  return s.trabajos
-    .filter((t) => ESTADOS_CON_SALDO.includes(t.estado))
-    .reduce((acc, t) => {
-      const total = totalItems(s.items.filter((i) => i.trabajoId === t.id));
-      const cobrado = sumaMontos(s.cobros.filter((c) => c.trabajoId === t.id));
-      return acc + Math.max(0, total - cobrado);
-    }, 0);
+/**
+ * Lo que falta cobrar hoy de los trabajos aprobados en adelante (no depende del mes).
+ * Por trabajo: max(0, total de ítems redondeado − cobrado), igual que totalItems/saldo
+ * de lib/calculos. Se calcula en la base para no traer el historial de ítems y cobros.
+ */
+export async function totalPorCobrar(prisma: PrismaClient): Promise<number> {
+  const [fila] = await prisma.$queryRaw<{ total: number }[]>`
+    WITH trabajos AS (
+      SELECT "id" FROM "Trabajo" WHERE "estado" IN ('APROBADO', 'EN_CURSO', 'TERMINADO', 'COBRADO')
+    ), precios AS (
+      SELECT i."trabajoId" AS id, ROUND(SUM(i."cantidad" * i."precioUnitario")::numeric) AS total
+      FROM "ItemTrabajo" i JOIN trabajos t ON t."id" = i."trabajoId"
+      GROUP BY i."trabajoId"
+    ), cobrado AS (
+      SELECT c."trabajoId" AS id, SUM(c."monto") AS cobrado
+      FROM "Cobro" c JOIN trabajos t ON t."id" = c."trabajoId"
+      GROUP BY c."trabajoId"
+    )
+    SELECT COALESCE(SUM(GREATEST(0, p.total - COALESCE(c.cobrado, 0))), 0)::float8 AS total
+    FROM precios p LEFT JOIN cobrado c ON c.id = p.id`;
+  return Number(fila?.total ?? 0);
 }
 
 // ───────────────────────── Reporte del mes ─────────────────────────
@@ -154,88 +176,120 @@ export type ReporteMes = {
   topClientes: { id: string; nombre: string; cobrado: number; cobros: number }[];
 };
 
-function armarReporte(s: Store, { info, desde, hasta }: Periodo): ReporteMes {
-  const cobrado = sumaMontos(delPeriodo(s.cobros, desde, hasta));
-  const gastosMes = delPeriodo(s.gastos, desde, hasta);
-  const gastos = sumaMontos(gastosMes);
+/** Suma montos por mes ("2026-11") en hora de Argentina. */
+function porMes(filas: { fecha: Date; monto: number }[]): Map<string, number> {
+  const mapa = new Map<string, number>();
+  for (const f of filas) {
+    const clave = claveDe(f.fecha);
+    mapa.set(clave, (mapa.get(clave) ?? 0) + f.monto);
+  }
+  return mapa;
+}
 
+async function topClientesDe(prisma: PrismaClient, desde: Date, hasta: Date): Promise<ReporteMes["topClientes"]> {
+  const grupos = await prisma.cobro.groupBy({
+    by: ["clienteId"],
+    where: { fecha: enRango(desde, hasta) },
+    _sum: { monto: true },
+    _count: { _all: true },
+    orderBy: [{ _sum: { monto: "desc" } }, { clienteId: "asc" }],
+    take: 5,
+  });
+  if (grupos.length === 0) return [];
+  const clientes = await prisma.cliente.findMany({
+    where: { id: { in: grupos.map((g) => g.clienteId) } },
+    select: { id: true, nombre: true },
+  });
+  const nombres = new Map(clientes.map((c) => [c.id, c.nombre]));
+  return grupos.map((g) => ({
+    id: g.clienteId,
+    nombre: nombres.get(g.clienteId) ?? "Cliente",
+    cobrado: g._sum.monto ?? 0,
+    cobros: g._count._all,
+  }));
+}
+
+async function armarReporte(prisma: PrismaClient, { info, desde, hasta }: Periodo): Promise<ReporteMes> {
+  const delMes = enRango(desde, hasta);
+  // Serie de 6 meses: una consulta por tabla con el rango completo, se agrupa por mes acá.
+  const desde6 = inicioMes(sumarMeses(desde, -5));
+
+  const [cobros6, gastos6, categorias, tipos, terminados, topClientes, porCobrar] = await Promise.all([
+    prisma.cobro.findMany({ where: { fecha: enRango(desde6, hasta) }, select: { fecha: true, monto: true } }),
+    prisma.gasto.findMany({ where: { fecha: enRango(desde6, hasta) }, select: { fecha: true, monto: true } }),
+    gastosPorCategoria(prisma, desde, hasta),
+    // Trabajos del mes: los que tuvieron al menos una visita (turno no cancelado)
+    // que empezó en el mes, o que se terminaron en el mes. Cada trabajo cuenta una
+    // sola vez y los trabajos cancelados no cuentan.
+    prisma.trabajo.groupBy({
+      by: ["tipo"],
+      where: {
+        estado: { not: "CANCELADO" },
+        OR: [{ turnos: { some: { estado: { not: "CANCELADO" }, inicio: delMes } } }, { fechaTerminado: delMes }],
+      },
+      _count: { _all: true },
+    }),
+    // Rentabilidad: trabajos terminados (o ya cobrados) con fecha de terminado en el mes.
+    prisma.trabajo.findMany({
+      where: { estado: { in: ["TERMINADO", "COBRADO"] }, fechaTerminado: delMes },
+      orderBy: [{ fechaTerminado: "desc" }, { numero: "desc" }],
+      select: {
+        id: true,
+        numero: true,
+        titulo: true,
+        cliente: { select: { nombre: true } },
+        items: { select: { cantidad: true, precioUnitario: true } },
+        movimientos: { where: { tipo: "CONSUMO" }, select: { cantidad: true, costoUnitario: true } },
+        jornadas: { select: { monto: true } },
+      },
+    }),
+    topClientesDe(prisma, desde, hasta),
+    totalPorCobrar(prisma),
+  ]);
+
+  const cobradoPorMes = porMes(cobros6);
+  const gastadoPorMes = porMes(gastos6);
   const ultimos6 = Array.from({ length: 6 }, (_, i) => {
     const d = sumarMeses(desde, i - 5);
-    const ini = inicioMes(d);
-    const fin = finMes(d);
+    const clave = claveDe(d);
     return {
-      clave: claveDe(d),
+      clave,
       corto: formatMesCorto(d),
       label: formatMes(d),
-      cobrado: sumaMontos(delPeriodo(s.cobros, ini, fin)),
-      gastos: sumaMontos(delPeriodo(s.gastos, ini, fin)),
+      cobrado: cobradoPorMes.get(clave) ?? 0,
+      gastos: gastadoPorMes.get(clave) ?? 0,
     };
   });
+  const cobrado = cobradoPorMes.get(info.clave) ?? 0;
+  const gastos = gastadoPorMes.get(info.clave) ?? 0;
 
-  // Trabajos del mes: los que tuvieron al menos una visita (turno no cancelado)
-  // que empezó en el mes, o que se terminaron en el mes. Cada trabajo cuenta una
-  // sola vez y los trabajos cancelados no cuentan.
-  const idsConVisita = new Set(
-    s.turnos.filter((t) => t.estado !== "CANCELADO" && entre(t.inicio, desde, hasta)).map((t) => t.trabajoId),
-  );
-  const trabajosMes = s.trabajos.filter(
-    (t) =>
-      t.estado !== "CANCELADO" &&
-      (idsConVisita.has(t.id) || (t.fechaTerminado !== null && entre(t.fechaTerminado, desde, hasta))),
-  );
-  const conteo = new Map<TipoTrabajo, number>();
-  for (const t of trabajosMes) conteo.set(t.tipo, (conteo.get(t.tipo) ?? 0) + 1);
-  const trabajosPorTipo = [...conteo.entries()]
-    .map(([tipo, cantidad]) => ({ tipo, label: TIPO_TRABAJO[tipo], cantidad }))
-    .sort((a, b) => b.cantidad - a.cantidad);
+  const trabajosPorTipo = tipos
+    .map((t) => ({ tipo: t.tipo, label: TIPO_TRABAJO[t.tipo], cantidad: t._count._all }))
+    .sort((a, b) => b.cantidad - a.cantidad || a.label.localeCompare(b.label, "es"));
 
-  // Rentabilidad: trabajos terminados (o ya cobrados) con fecha de terminado en el mes.
-  const rent = s.trabajos
-    .filter(
-      (t) =>
-        (t.estado === "TERMINADO" || t.estado === "COBRADO") &&
-        t.fechaTerminado !== null &&
-        entre(t.fechaTerminado, desde, hasta),
-    )
-    .sort((a, b) => (b.fechaTerminado?.getTime() ?? 0) - (a.fechaTerminado?.getTime() ?? 0))
-    .map((t) => {
-      const precio = totalItems(s.items.filter((i) => i.trabajoId === t.id));
-      const insumos = costoConsumos(s.movimientos.filter((m) => m.trabajoId === t.id && m.tipo === "CONSUMO"));
-      const personal = sumaMontos(s.jornadas.filter((j) => j.trabajoId === t.id));
-      return {
-        id: t.id,
-        numero: t.numero,
-        titulo: t.titulo,
-        cliente: s.clientes.find((c) => c.id === t.clienteId)?.nombre ?? "Cliente",
-        ...rentabilidad(precio, insumos, personal),
-      };
-    });
+  const rent = terminados.map((t) => ({
+    id: t.id,
+    numero: t.numero,
+    titulo: t.titulo,
+    cliente: t.cliente.nombre,
+    ...rentabilidad(totalItems(t.items), costoConsumos(t.movimientos), sumaMontos(t.jornadas)),
+  }));
   const rentabilidadTotal = rentabilidad(
     sumaMontos(rent.map((r) => ({ monto: r.precio }))),
     sumaMontos(rent.map((r) => ({ monto: r.insumos }))),
     sumaMontos(rent.map((r) => ({ monto: r.personal }))),
   );
 
-  const porCliente = new Map<string, { cobrado: number; cobros: number }>();
-  for (const c of delPeriodo(s.cobros, desde, hasta)) {
-    const actual = porCliente.get(c.clienteId) ?? { cobrado: 0, cobros: 0 };
-    porCliente.set(c.clienteId, { cobrado: actual.cobrado + c.monto, cobros: actual.cobros + 1 });
-  }
-  const topClientes = [...porCliente.entries()]
-    .map(([id, v]) => ({ id, nombre: s.clientes.find((c) => c.id === id)?.nombre ?? "Cliente", ...v }))
-    .sort((a, b) => b.cobrado - a.cobrado)
-    .slice(0, 5);
-
   return {
     mes: info,
     cobrado,
     gastos,
     ganancia: cobrado - gastos,
-    porCobrar: totalPorCobrar(s),
+    porCobrar,
     ultimos6,
     trabajosPorTipo,
-    trabajosTotal: trabajosMes.length,
-    gastosPorCategoria: porCategoria(gastosMes),
+    trabajosTotal: sumaMontos(trabajosPorTipo.map((t) => ({ monto: t.cantidad }))),
+    gastosPorCategoria: categorias,
     rentabilidad: rent,
     rentabilidadTotal,
     topClientes,
@@ -243,8 +297,8 @@ function armarReporte(s: Store, { info, desde, hasta }: Periodo): ReporteMes {
 }
 
 export async function reporteDelMes(clave: string | undefined): Promise<ReporteMes> {
-  const s = await leerStore();
-  return armarReporte(s, resolverMes(clave, ahora()));
+  const prisma = await leerDb();
+  return armarReporte(prisma, resolverMes(clave, ahora()));
 }
 
 // ───────────────────────── Movimientos (Excel y cierre) ─────────────────────────
@@ -260,24 +314,46 @@ export type Movimiento = {
   monto: number;
 };
 
-function movimientosDe(s: Store, desde: Date, hasta: Date): { cobros: Movimiento[]; gastos: Movimiento[] } {
-  const cobros = delPeriodo(s.cobros, desde, hasta)
-    .map((c): Movimiento => {
-      const cliente = s.clientes.find((x) => x.id === c.clienteId)?.nombre ?? "Cliente";
-      const trabajo = c.trabajoId ? s.trabajos.find((t) => t.id === c.trabajoId) : undefined;
-      return {
+async function movimientosDe(
+  prisma: PrismaClient,
+  desde: Date,
+  hasta: Date,
+): Promise<{ cobros: Movimiento[]; gastos: Movimiento[] }> {
+  const delMes = enRango(desde, hasta);
+  const orden = [{ fecha: "asc" }, { createdAt: "asc" }, { id: "asc" }] as const;
+  const [cobros, gastos] = await Promise.all([
+    prisma.cobro.findMany({
+      where: { fecha: delMes },
+      orderBy: [...orden],
+      select: {
+        id: true,
+        fecha: true,
+        monto: true,
+        medio: true,
+        concepto: true,
+        cliente: { select: { nombre: true } },
+        trabajo: { select: { numero: true, titulo: true } },
+      },
+    }),
+    prisma.gasto.findMany({
+      where: { fecha: delMes },
+      orderBy: [...orden],
+      select: { id: true, fecha: true, categoria: true, descripcion: true, medio: true, monto: true },
+    }),
+  ]);
+  return {
+    cobros: cobros.map(
+      (c): Movimiento => ({
         id: c.id,
         fecha: c.fecha,
         tipo: "Cobro",
         rubro: c.concepto ?? "Cobro",
-        detalle: trabajo ? `${cliente} · #${trabajo.numero} ${trabajo.titulo}` : cliente,
+        detalle: c.trabajo ? `${c.cliente.nombre} · #${c.trabajo.numero} ${c.trabajo.titulo}` : c.cliente.nombre,
         medio: MEDIO_PAGO[c.medio],
         monto: c.monto,
-      };
-    })
-    .sort((a, b) => a.fecha.getTime() - b.fecha.getTime());
-  const gastos = delPeriodo(s.gastos, desde, hasta)
-    .map(
+      }),
+    ),
+    gastos: gastos.map(
       (g): Movimiento => ({
         id: g.id,
         fecha: g.fecha,
@@ -287,17 +363,16 @@ function movimientosDe(s: Store, desde: Date, hasta: Date): { cobros: Movimiento
         medio: MEDIO_PAGO[g.medio],
         monto: g.monto,
       }),
-    )
-    .sort((a, b) => a.fecha.getTime() - b.fecha.getTime());
-  return { cobros, gastos };
+    ),
+  };
 }
 
 export async function movimientosDelMes(
   clave: string | undefined,
 ): Promise<{ mes: MesInfo; cobros: Movimiento[]; gastos: Movimiento[]; cobrado: number; gastado: number }> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const { info, desde, hasta } = resolverMes(clave, ahora());
-  const { cobros, gastos } = movimientosDe(s, desde, hasta);
+  const { cobros, gastos } = await movimientosDe(prisma, desde, hasta);
   return { mes: info, cobros, gastos, cobrado: sumaMontos(cobros), gastado: sumaMontos(gastos) };
 }
 
@@ -309,20 +384,24 @@ export type CierreMes = ReporteMes & {
 };
 
 export async function cierreDelMes(clave: string | undefined): Promise<CierreMes> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = ahora();
   const periodo = resolverMes(clave, hoy);
-  const { cobros, gastos } = movimientosDe(s, periodo.desde, periodo.hasta);
+  const [reporte, { cobros, gastos }, empresa] = await Promise.all([
+    armarReporte(prisma, periodo),
+    movimientosDe(prisma, periodo.desde, periodo.hasta),
+    datosEmpresa(),
+  ]);
   return {
-    ...armarReporte(s, periodo),
+    ...reporte,
     cobros,
     gastosDetalle: gastos,
     empresa: {
-      nombre: s.empresa.nombreFantasia,
-      razonSocial: s.empresa.razonSocial,
-      cuit: s.empresa.cuit,
-      telefono: s.empresa.telefono,
-      email: s.empresa.email,
+      nombre: empresa.nombreFantasia,
+      razonSocial: empresa.razonSocial,
+      cuit: empresa.cuit,
+      telefono: empresa.telefono,
+      email: empresa.email,
     },
     generado: hoy,
   };
@@ -342,28 +421,42 @@ export type ResumenMenu = {
 };
 
 export async function resumenMenu(): Promise<ResumenMenu> {
-  const s = await leerStore();
+  const prisma = await leerDb();
   const hoy = ahora();
   const { info, desde, hasta } = resolverMes(undefined, hoy);
+  const delMes = enRango(desde, hasta);
 
-  const deudaProveedores = s.proveedores.reduce((acc, p) => {
-    const comprado = sumaMontos(s.compras.filter((c) => c.proveedorId === p.id).map((c) => ({ monto: c.total })));
-    const pagado = sumaMontos(s.pagosProveedor.filter((x) => x.proveedorId === p.id));
-    return acc + Math.max(0, comprado - pagado);
-  }, 0);
+  const [trabajosEnCurso, presupuestosPorVencer, insumos, compras, pagos, gastosMes, cobradoMes, empleados] =
+    await Promise.all([
+      prisma.trabajo.count({ where: { estado: "EN_CURSO" } }),
+      // Vencen entre hoy y dentro de 3 días (días de calendario en Argentina).
+      prisma.trabajo.count({
+        where: { estado: "PRESUPUESTO", validoHasta: enRango(inicioDia(hoy), finDia(sumarDias(hoy, 3))) },
+      }),
+      // Tabla chica: se trae entera (activos) y se compara con la misma regla de lib/calculos.
+      prisma.insumo.findMany({ where: { activo: true }, select: { stock: true, stockMinimo: true } }),
+      prisma.compra.groupBy({ by: ["proveedorId"], _sum: { total: true } }),
+      prisma.pagoProveedor.groupBy({ by: ["proveedorId"], _sum: { monto: true } }),
+      prisma.gasto.aggregate({ where: { fecha: delMes }, _sum: { monto: true } }),
+      prisma.cobro.aggregate({ where: { fecha: delMes }, _sum: { monto: true } }),
+      prisma.empleado.findMany({ where: { activo: true }, select: { nombre: true } }),
+    ]);
+
+  // Deuda por proveedor (comprado − pagado, nunca negativa) y después el total.
+  const pagadoA = new Map(pagos.map((p) => [p.proveedorId, p._sum.monto ?? 0]));
+  const deudaProveedores = compras.reduce(
+    (acc, c) => acc + Math.max(0, (c._sum.total ?? 0) - (pagadoA.get(c.proveedorId) ?? 0)),
+    0,
+  );
 
   return {
     mes: info,
-    trabajosEnCurso: s.trabajos.filter((t) => t.estado === "EN_CURSO").length,
-    presupuestosPorVencer: s.trabajos.filter((t) => {
-      if (t.estado !== "PRESUPUESTO" || !t.validoHasta) return false;
-      const dias = diasHasta(t.validoHasta, hoy);
-      return dias >= 0 && dias <= 3;
-    }).length,
-    insumosBajos: s.insumos.filter((i) => i.activo && estadoStock(i) !== "ok").length,
+    trabajosEnCurso,
+    presupuestosPorVencer,
+    insumosBajos: insumos.filter((i) => estadoStock(i) !== "ok").length,
     deudaProveedores,
-    gastosMes: sumaMontos(delPeriodo(s.gastos, desde, hasta)),
-    cobradoMes: sumaMontos(delPeriodo(s.cobros, desde, hasta)),
-    empleadosActivos: s.empleados.filter((e) => e.activo).map((e) => e.nombre),
+    gastosMes: gastosMes._sum.monto ?? 0,
+    cobradoMes: cobradoMes._sum.monto ?? 0,
+    empleadosActivos: empleados.map((e) => e.nombre).sort((a, b) => a.localeCompare(b, "es")),
   };
 }

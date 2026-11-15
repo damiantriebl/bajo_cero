@@ -3,11 +3,14 @@
 import { z } from "zod";
 import { redirect } from "next/navigation";
 import { refresh, revalidatePath } from "next/cache";
-import { storeParaAcciones } from "@/lib/mock/store";
-import { nuevoInsumo, nuevoMovimiento } from "@/lib/mock/fabricas";
+import { db } from "@/lib/db";
+import { Prisma } from "@/lib/generated/prisma/client";
 import { Unidad } from "@/lib/generated/prisma/enums";
 import { datosDe, erroresDeZod, zCantidad, zEnum, zPesosOpcional, zTexto, zTextoOpcional, type EstadoForm } from "@/lib/forms";
 import { cantidadUnidad } from "./_components/stock";
+
+const REVISAR = "Revisá los campos marcados.";
+const NO_EXISTE = "Este insumo ya no existe.";
 
 /** Cantidad que puede quedar vacía (→ 0). Acepta "2,5" o "2.5". */
 const zCantidadOCero = (mensaje: string) =>
@@ -36,16 +39,27 @@ const esquemaEditar = z.object(camposInsumo);
 /** Evita errores de coma flotante al sumar cantidades (2,5 + 0,1…). */
 const redondear = (n: number) => Math.round(n * 1000) / 1000;
 
-const mismoNombre = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
+/** Código de un error conocido de Prisma (P2002, P2003, P2025…) o null. */
+const codigoPrisma = (e: unknown) => (e instanceof Prisma.PrismaClientKnownRequestError ? e.code : null);
 
-function validarReferencias(d: { nombre: string; proveedorId: string | null }, idActual?: string): EstadoForm {
-  const s = storeParaAcciones();
-  if (d.proveedorId && !s.proveedores.some((p) => p.id === d.proveedorId)) {
-    return { error: "Revisá los campos marcados.", errores: { proveedorId: "Elegí un proveedor de la lista" } };
-  }
-  if (s.insumos.some((i) => i.activo && i.id !== idActual && mismoNombre(i.nombre, d.nombre))) {
-    return { error: "Revisá los campos marcados.", errores: { nombre: "Ya tenés un insumo con ese nombre" } };
-  }
+/** Error del proveedor elegido (no existe o lo borraron mientras se cargaba el formulario). */
+const PROVEEDOR_INVALIDO: EstadoForm = { error: REVISAR, errores: { proveedorId: "Elegí un proveedor de la lista" } };
+
+/** El proveedor elegido existe y no hay otro insumo activo con el mismo nombre (sin importar mayúsculas). */
+async function validarReferencias(d: { nombre: string; proveedorId: string | null }, idActual?: string): Promise<EstadoForm> {
+  const [proveedor, repetido] = await Promise.all([
+    d.proveedorId ? db().proveedor.findUnique({ where: { id: d.proveedorId }, select: { id: true } }) : null,
+    db().insumo.findFirst({
+      where: {
+        activo: true,
+        nombre: { equals: d.nombre.trim(), mode: "insensitive" },
+        ...(idActual && { id: { not: idActual } }),
+      },
+      select: { id: true },
+    }),
+  ]);
+  if (d.proveedorId && !proveedor) return PROVEEDOR_INVALIDO;
+  if (repetido) return { error: REVISAR, errores: { nombre: "Ya tenés un insumo con ese nombre" } };
   return null;
 }
 
@@ -53,37 +67,37 @@ export async function crearInsumo(_prev: EstadoForm, formData: FormData): Promis
   const r = esquemaNuevo.safeParse(datosDe(formData));
   if (!r.success) return erroresDeZod(r.error);
   const d = r.data;
-  const problema = validarReferencias(d);
+  const problema = await validarReferencias(d);
   if (problema) return problema;
 
-  const s = storeParaAcciones();
-  const ahora = new Date();
-  const insumo = nuevoInsumo(
-    {
-      nombre: d.nombre,
-      categoria: d.categoria,
-      unidad: d.unidad,
-      stock: redondear(d.stock),
-      stockMinimo: redondear(d.stockMinimo),
-      costoUnitario: d.costoUnitario ?? 0,
-      precioVenta: d.precioVenta,
-      proveedorId: d.proveedorId,
-    },
-    ahora,
-  );
-  s.insumos.push(insumo);
-  // El stock inicial queda en el historial para que la suma de movimientos cierre.
-  if (insumo.stock > 0) {
-    s.movimientos.push(
-      nuevoMovimiento(
-        { insumoId: insumo.id, tipo: "AJUSTE", cantidad: insumo.stock, costoUnitario: insumo.costoUnitario, notas: "Stock inicial", fecha: ahora },
-        ahora,
-      ),
-    );
+  const stock = redondear(d.stock);
+  const costoUnitario = d.costoUnitario ?? 0;
+  let id: string;
+  try {
+    // Una sola escritura anidada (atómica): el insumo y, si arranca con stock, su movimiento.
+    const insumo = await db().insumo.create({
+      data: {
+        nombre: d.nombre,
+        categoria: d.categoria,
+        unidad: d.unidad,
+        stock,
+        stockMinimo: redondear(d.stockMinimo),
+        costoUnitario,
+        precioVenta: d.precioVenta,
+        proveedorId: d.proveedorId,
+        // El stock inicial queda en el historial para que la suma de movimientos cierre.
+        movimientos: stock > 0 ? { create: { tipo: "AJUSTE", cantidad: stock, costoUnitario, notas: "Stock inicial" } } : undefined,
+      },
+      select: { id: true },
+    });
+    id = insumo.id;
+  } catch (e) {
+    if (codigoPrisma(e) === "P2003") return PROVEEDOR_INVALIDO;
+    throw e;
   }
 
   revalidatePath("/insumos");
-  redirect(`/insumos/${insumo.id}`);
+  redirect(`/insumos/${id}`);
 }
 
 export async function editarInsumo(id: string, _prev: EstadoForm, formData: FormData): Promise<EstadoForm> {
@@ -91,19 +105,33 @@ export async function editarInsumo(id: string, _prev: EstadoForm, formData: Form
   if (!r.success) return erroresDeZod(r.error);
   const d = r.data;
 
-  const s = storeParaAcciones();
-  const insumo = s.insumos.find((i) => i.id === id);
-  if (!insumo) return { error: "Este insumo ya no existe." };
-  const problema = validarReferencias(d, id);
+  const [existe, problema] = await Promise.all([
+    db().insumo.findUnique({ where: { id }, select: { id: true } }),
+    validarReferencias(d, id),
+  ]);
+  if (!existe) return { error: NO_EXISTE };
   if (problema) return problema;
 
-  insumo.nombre = d.nombre;
-  insumo.categoria = d.categoria;
-  insumo.unidad = d.unidad;
-  insumo.stockMinimo = redondear(d.stockMinimo);
-  insumo.costoUnitario = d.costoUnitario ?? 0;
-  insumo.precioVenta = d.precioVenta;
-  insumo.proveedorId = d.proveedorId;
+  try {
+    await db().insumo.update({
+      where: { id },
+      data: {
+        nombre: d.nombre,
+        categoria: d.categoria,
+        unidad: d.unidad,
+        stockMinimo: redondear(d.stockMinimo),
+        costoUnitario: d.costoUnitario ?? 0,
+        precioVenta: d.precioVenta,
+        proveedorId: d.proveedorId,
+      },
+      select: { id: true },
+    });
+  } catch (e) {
+    const codigo = codigoPrisma(e);
+    if (codigo === "P2025") return { error: NO_EXISTE };
+    if (codigo === "P2003") return PROVEEDOR_INVALIDO;
+    throw e;
+  }
 
   revalidatePath("/insumos");
   redirect(`/insumos/${id}`);
@@ -120,30 +148,46 @@ export async function ajustarStock(id: string, _prev: EstadoForm, formData: Form
   const r = esquemaAjuste.safeParse(datosDe(formData));
   if (!r.success) return erroresDeZod(r.error);
   const { sentido, cantidad, motivo } = r.data;
+  const cambio = redondear(sentido === "sumar" ? cantidad : -cantidad);
 
-  const s = storeParaAcciones();
-  const insumo = s.insumos.find((i) => i.id === id);
-  if (!insumo) return { error: "Este insumo ya no existe." };
+  let resultado: EstadoForm;
+  try {
+    // Serializable: si dos ajustes del mismo insumo se cruzan, uno falla (P2034) en vez de
+    // dejar el stock bajo cero. El control de "no alcanza" lee el stock dentro de la transacción.
+    resultado = await db().$transaction(
+      async (tx): Promise<EstadoForm> => {
+        const insumo = await tx.insumo.findUnique({ where: { id }, select: { stock: true, unidad: true, costoUnitario: true } });
+        if (!insumo) return { error: NO_EXISTE };
+        if (redondear(insumo.stock + cambio) < 0) {
+          return {
+            error: REVISAR,
+            errores: { cantidad: `Hay ${cantidadUnidad(insumo.stock, insumo.unidad)}: no podés restar más que eso` },
+          };
+        }
 
-  const cambio = sentido === "sumar" ? cantidad : -cantidad;
-  const nuevoStock = redondear(insumo.stock + cambio);
-  if (nuevoStock < 0) {
-    return {
-      error: "Revisá los campos marcados.",
-      errores: { cantidad: `Hay ${cantidadUnidad(insumo.stock, insumo.unidad)}: no podés restar más que eso` },
-    };
+        await tx.movimientoStock.create({
+          data: { insumoId: id, tipo: "AJUSTE", cantidad: cambio, costoUnitario: insumo.costoUnitario, notas: motivo },
+          select: { id: true },
+        });
+        const actualizado = await tx.insumo.update({
+          where: { id },
+          data: { stock: { increment: cambio } },
+          select: { stock: true },
+        });
+        return { ok: `Listo: ahora hay ${cantidadUnidad(redondear(actualizado.stock), insumo.unidad)}.` };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+    );
+  } catch (e) {
+    const codigo = codigoPrisma(e);
+    if (codigo === "P2025") return { error: NO_EXISTE };
+    if (codigo === "P2034") return { error: "Justo se modificó el stock de este insumo. Probá de nuevo." };
+    throw e;
   }
 
-  const ahora = new Date();
-  s.movimientos.push(
-    nuevoMovimiento(
-      { insumoId: id, tipo: "AJUSTE", cantidad: redondear(cambio), costoUnitario: insumo.costoUnitario, notas: motivo, fecha: ahora },
-      ahora,
-    ),
-  );
-  insumo.stock = nuevoStock;
-
-  revalidatePath("/insumos");
-  refresh();
-  return { ok: `Listo: ahora hay ${cantidadUnidad(nuevoStock, insumo.unidad)}.` };
+  if (resultado?.ok) {
+    revalidatePath("/insumos");
+    refresh();
+  }
+  return resultado;
 }
