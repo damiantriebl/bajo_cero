@@ -1,0 +1,437 @@
+// Modelo de datos de Bajo Cero.
+// Importes en pesos enteros (Int). Cantidades de insumos en Float (metros, kilos).
+// La conexión (url) va en prisma.config.ts — Prisma 7 no la admite acá.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────── Empresa y usuarios ─────────────────────────
+
+model Empresa {
+  id                     String  @id @default("empresa")
+  razonSocial            String
+  nombreFantasia         String  @default("Bajo Cero")
+  cuit                   String?
+  telefono               String?
+  email                  String?
+  direccion              String?
+  condicionesPresupuesto String?
+  garantia               String?
+  validezPresupuestoDias Int     @default(15)
+}
+
+enum Rol {
+  DUENO
+  ADMINISTRATIVO
+  TECNICO
+}
+
+model Usuario {
+  id         String    @id @default(cuid())
+  nombre     String
+  email      String    @unique
+  rol        Rol       @default(TECNICO)
+  activo     Boolean   @default(true)
+  empleadoId String?   @unique
+  empleado   Empleado? @relation(fields: [empleadoId], references: [id])
+  createdAt  DateTime  @default(now())
+}
+
+// ───────────────────────── Clientes y equipos ─────────────────────────
+
+enum TipoCliente {
+  PARTICULAR
+  EMPRESA
+  CONSORCIO
+}
+
+model Cliente {
+  id        String      @id @default(cuid())
+  nombre    String
+  tipo      TipoCliente @default(PARTICULAR)
+  telefono  String?
+  email     String?
+  direccion String?
+  localidad String?
+  cuit      String?
+  notas     String?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  equipos  Equipo[]
+  trabajos Trabajo[]
+  cobros   Cobro[]
+
+  @@index([nombre])
+}
+
+enum TipoEquipo {
+  SPLIT
+  PISO_TECHO
+  CASSETTE
+  VENTANA
+  PORTATIL
+  CENTRAL
+  OTRO
+}
+
+model Equipo {
+  id                   String     @id @default(cuid())
+  clienteId            String
+  cliente              Cliente    @relation(fields: [clienteId], references: [id], onDelete: Cascade)
+  tipo                 TipoEquipo @default(SPLIT)
+  marca                String?
+  modelo               String?
+  frigorias            Int?
+  ubicacion            String?
+  fechaInstalacion     DateTime?
+  proximoMantenimiento DateTime?
+  notas                String?
+  createdAt            DateTime   @default(now())
+
+  @@index([clienteId])
+  @@index([proximoMantenimiento])
+}
+
+// ───────────────────────── Trabajos y presupuestos ─────────────────────────
+
+enum TipoTrabajo {
+  INSTALACION
+  MANTENIMIENTO
+  REPARACION
+  CARGA_GAS
+  DESINSTALACION
+  OTRO
+}
+
+enum EstadoTrabajo {
+  PRESUPUESTO
+  APROBADO
+  EN_CURSO
+  TERMINADO
+  COBRADO
+  CANCELADO
+}
+
+model Trabajo {
+  id               String        @id @default(cuid())
+  numero           Int           @unique @default(autoincrement())
+  clienteId        String
+  cliente          Cliente       @relation(fields: [clienteId], references: [id])
+  titulo           String
+  tipo             TipoTrabajo   @default(INSTALACION)
+  estado           EstadoTrabajo @default(PRESUPUESTO)
+  direccion        String?
+  descripcion      String?
+  condiciones      String?
+  fechaPresupuesto DateTime      @default(now())
+  validoHasta      DateTime?
+  fechaAprobado    DateTime?
+  fechaTerminado   DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  items       ItemTrabajo[]
+  turnos      Turno[]
+  cobros      Cobro[]
+  movimientos MovimientoStock[]
+  jornadas    Jornada[]
+  checklist   ChecklistItem[]
+  fotos       Foto[]
+  gastos      Gasto[]
+
+  @@index([clienteId])
+  @@index([estado])
+}
+
+// Lo que se le cobra al cliente (forma el presupuesto).
+model ItemTrabajo {
+  id             String  @id @default(cuid())
+  trabajoId      String
+  trabajo        Trabajo @relation(fields: [trabajoId], references: [id], onDelete: Cascade)
+  descripcion    String
+  cantidad       Float   @default(1)
+  unidad         String?
+  precioUnitario Int
+  orden          Int     @default(0)
+  insumoId       String?
+  insumo         Insumo? @relation(fields: [insumoId], references: [id])
+
+  @@index([trabajoId])
+}
+
+model ChecklistItem {
+  id        String  @id @default(cuid())
+  trabajoId String
+  trabajo   Trabajo @relation(fields: [trabajoId], references: [id], onDelete: Cascade)
+  texto     String
+  hecho     Boolean @default(false)
+  orden     Int     @default(0)
+
+  @@index([trabajoId])
+}
+
+model Foto {
+  id          String   @id @default(cuid())
+  trabajoId   String
+  trabajo     Trabajo  @relation(fields: [trabajoId], references: [id], onDelete: Cascade)
+  url         String
+  descripcion String?
+  createdAt   DateTime @default(now())
+
+  @@index([trabajoId])
+}
+
+// ───────────────────────── Agenda (turnero) ─────────────────────────
+
+enum EstadoTurno {
+  A_CONFIRMAR
+  CONFIRMADO
+  REALIZADO
+  CANCELADO
+}
+
+model Turno {
+  id        String      @id @default(cuid())
+  trabajoId String
+  trabajo   Trabajo     @relation(fields: [trabajoId], references: [id], onDelete: Cascade)
+  inicio    DateTime
+  fin       DateTime
+  estado    EstadoTurno @default(A_CONFIRMAR)
+  notas     String?
+  tecnicos  Empleado[]
+  createdAt DateTime    @default(now())
+
+  @@index([inicio])
+  @@index([trabajoId])
+}
+
+// ───────────────────────── Cobros ─────────────────────────
+
+enum MedioPago {
+  EFECTIVO
+  TRANSFERENCIA
+  MERCADO_PAGO
+  TARJETA
+  CHEQUE
+  OTRO
+}
+
+model Cobro {
+  id             String    @id @default(cuid())
+  clienteId      String
+  cliente        Cliente   @relation(fields: [clienteId], references: [id])
+  trabajoId      String?
+  trabajo        Trabajo?  @relation(fields: [trabajoId], references: [id])
+  fecha          DateTime  @default(now())
+  monto          Int
+  medio          MedioPago @default(TRANSFERENCIA)
+  concepto       String?
+  comprobanteUrl String?
+  notas          String?
+  createdAt      DateTime  @default(now())
+
+  @@index([clienteId])
+  @@index([trabajoId])
+  @@index([fecha])
+}
+
+// ───────────────────────── Proveedores, compras e insumos ─────────────────────────
+
+model Proveedor {
+  id        String   @id @default(cuid())
+  nombre    String
+  rubro     String?
+  contacto  String?
+  telefono  String?
+  email     String?
+  cuit      String?
+  direccion String?
+  notas     String?
+  createdAt DateTime @default(now())
+
+  compras Compra[]
+  pagos   PagoProveedor[]
+  insumos Insumo[]
+  gastos  Gasto[]
+}
+
+model Compra {
+  id             String    @id @default(cuid())
+  proveedorId    String
+  proveedor      Proveedor @relation(fields: [proveedorId], references: [id])
+  fecha          DateTime  @default(now())
+  numeroFactura  String?
+  total          Int
+  vencimiento    DateTime?
+  comprobanteUrl String?
+  notas          String?
+  createdAt      DateTime  @default(now())
+
+  items       ItemCompra[]
+  movimientos MovimientoStock[]
+  gasto       Gasto?
+  pagos       PagoProveedor[]
+
+  @@index([proveedorId])
+  @@index([fecha])
+}
+
+model ItemCompra {
+  id             String  @id @default(cuid())
+  compraId       String
+  compra         Compra  @relation(fields: [compraId], references: [id], onDelete: Cascade)
+  insumoId       String?
+  insumo         Insumo? @relation(fields: [insumoId], references: [id])
+  descripcion    String
+  cantidad       Float
+  precioUnitario Int
+
+  @@index([compraId])
+}
+
+model PagoProveedor {
+  id          String    @id @default(cuid())
+  proveedorId String
+  proveedor   Proveedor @relation(fields: [proveedorId], references: [id])
+  // Compra que salda (opcional: un pago a cuenta no la tiene).
+  compraId    String?
+  compra      Compra?   @relation(fields: [compraId], references: [id])
+  fecha       DateTime  @default(now())
+  monto       Int
+  medio       MedioPago @default(TRANSFERENCIA)
+  notas       String?
+  createdAt   DateTime  @default(now())
+
+  @@index([proveedorId])
+  @@index([compraId])
+}
+
+enum Unidad {
+  UNIDAD
+  METRO
+  KILO
+  PAR
+  ROLLO
+  LITRO
+}
+
+model Insumo {
+  id            String     @id @default(cuid())
+  nombre        String
+  categoria     String?
+  unidad        Unidad     @default(UNIDAD)
+  stock         Float      @default(0)
+  stockMinimo   Float      @default(0)
+  costoUnitario Int        @default(0)
+  precioVenta   Int?
+  proveedorId   String?
+  proveedor     Proveedor? @relation(fields: [proveedorId], references: [id])
+  activo        Boolean    @default(true)
+  createdAt     DateTime   @default(now())
+
+  movimientos  MovimientoStock[]
+  itemsCompra  ItemCompra[]
+  itemsTrabajo ItemTrabajo[]
+
+  @@index([nombre])
+}
+
+enum TipoMovimiento {
+  COMPRA
+  CONSUMO
+  AJUSTE
+}
+
+// Cantidad con signo: + entra, − sale.
+model MovimientoStock {
+  id            String         @id @default(cuid())
+  insumoId      String
+  insumo        Insumo         @relation(fields: [insumoId], references: [id])
+  fecha         DateTime       @default(now())
+  tipo          TipoMovimiento
+  cantidad      Float
+  costoUnitario Int?
+  trabajoId     String?
+  trabajo       Trabajo?       @relation(fields: [trabajoId], references: [id])
+  compraId      String?
+  compra        Compra?        @relation(fields: [compraId], references: [id])
+  notas         String?
+
+  @@index([insumoId])
+  @@index([trabajoId])
+}
+
+// ───────────────────────── Personal y gastos ─────────────────────────
+
+model Empleado {
+  id        String   @id @default(cuid())
+  nombre    String
+  puesto    String   @default("Técnico")
+  telefono  String?
+  jornal    Int      @default(0)
+  activo    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  turnos   Turno[]
+  jornadas Jornada[]
+  gastos   Gasto[]
+  usuario  Usuario?
+}
+
+// Día trabajado (lo que se le debe). El pago se registra como Gasto PERSONAL.
+model Jornada {
+  id         String   @id @default(cuid())
+  empleadoId String
+  empleado   Empleado @relation(fields: [empleadoId], references: [id])
+  fecha      DateTime
+  trabajoId  String?
+  trabajo    Trabajo? @relation(fields: [trabajoId], references: [id])
+  horas      Float?
+  monto      Int
+  notas      String?
+
+  @@index([empleadoId])
+  @@index([fecha])
+}
+
+enum CategoriaGasto {
+  PERSONAL
+  MATERIALES
+  COMBUSTIBLE
+  HERRAMIENTAS
+  VEHICULO
+  IMPUESTOS
+  SERVICIOS
+  ALQUILER
+  OTROS
+}
+
+model Gasto {
+  id             String         @id @default(cuid())
+  fecha          DateTime       @default(now())
+  categoria      CategoriaGasto
+  descripcion    String
+  monto          Int
+  medio          MedioPago      @default(EFECTIVO)
+  empleadoId     String?
+  empleado       Empleado?      @relation(fields: [empleadoId], references: [id])
+  trabajoId      String?
+  trabajo        Trabajo?       @relation(fields: [trabajoId], references: [id])
+  proveedorId    String?
+  proveedor      Proveedor?     @relation(fields: [proveedorId], references: [id])
+  compraId       String?        @unique
+  compra         Compra?        @relation(fields: [compraId], references: [id])
+  comprobanteUrl String?
+  notas          String?
+  createdAt      DateTime       @default(now())
+
+  @@index([fecha])
+  @@index([categoria])
+}

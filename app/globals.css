@@ -1,26 +1,65 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* Tokens de Bajo Cero — tomados del logo: azul hielo, azul marca y azul noche. */
+@theme {
+  --color-canvas: #eef3f9;
+  --color-surface: #ffffff;
+  --color-surface-2: #f4f7fb;
+  --color-ink: #0b1437;
+  --color-muted: #55607a;
+  --color-muted-strong: #3f4a66;
+  --color-line: #d5deea;
+  --color-line-soft: #e3eaf3;
+  --color-track: #c9d6e6;
+
+  --color-brand: #0b6fcc;
+  --color-brand-hover: #095ead;
+  --color-brand-strong: #0b5cab;
+  --color-brand-soft: #e1f0fd;
+
+  --color-ice: #1e96eb;
+  --color-ice-light: #9cc9f5;
+  --color-night: #0b1437;
+  --color-night-text: #d6e2f2;
+  --color-night-track: #2a3563;
+
+  --color-warn: #a34a00;
+  --color-warn-strong: #6b3000;
+  --color-warn-soft: #ffebd6;
+  --color-ok: #086845;
+  --color-ok-soft: #ddf3ea;
+  --color-danger: #b42318;
+  --color-danger-soft: #fde8e6;
+
+  --font-sans: var(--font-barlow), "Segoe UI", system-ui, sans-serif;
+  --font-display: var(--font-barlow-condensed), "Arial Narrow", sans-serif;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  -webkit-tap-highlight-color: transparent;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+/* Montos alineados en columnas */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Deja espacio para la barra inferior y el gesto de inicio en iPhone */
+.pb-safe {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #ffffff;
+  }
 }
